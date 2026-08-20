@@ -4,29 +4,35 @@ import feedparser
 from .db import init_db, insert_rss
 
 FEEDS = [
-    # 路透社
+    # ===== 你原有的源 =====
     ("Reuters World", "https://feeds.reuters.com/reuters/worldNews"),
     ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
-    
-    # 新增：道琼斯/华尔街日报
     ("WSJ Markets", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
-    
-    # 新增：金融时报
     ("FT Home", "https://www.ft.com/rss/home"),
-    
-    # 新增：CNBC
     ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
-    
-    # 新增：彭博（Bloomberg 官方 RSS 可能需要特殊处理，以下地址可尝试）
     ("Bloomberg Markets", "https://feeds.bloomberg.com/markets/news.rss"),
-    
-    # 新增：雅虎财经
     ("Yahoo Finance", "https://finance.yahoo.com/rss/topstories"),
-    
-    # 如果想加入国内财经（部分可用）
-    # ("财新网", "https://rss.caixin.com/roll.xml"),
-]
 
+    # ===== 新增：彭博财富（更聚焦投资与财富管理） =====
+    ("Bloomberg Wealth", "https://feeds.bloomberg.com/wealth/news.rss"),
+
+    # ===== 新增：福布斯投资（投资策略与个人理财） =====
+    ("Forbes Investing", "https://www.forbes.com/investing/feed/"),
+
+    # ===== 新增：Investopedia（财经教育与市场分析） =====
+    ("Investopedia News", "https://www.investopedia.com/rss/news"),
+
+    # ===== 新增：BBC 商业新闻（英国广播公司） =====
+    ("BBC Business", "http://feeds.bbci.co.uk/news/business/rss.xml"),
+
+    # ===== 新增：路透社市场新闻（更聚焦市场动态） =====
+    ("Reuters Markets", "https://feeds.reuters.com/reuters/MarketsNews"),
+
+    # ===== 国内财经（通过 RSSHub 中转） =====
+    # 注意：RSSHub 是第三方服务，稳定性依赖其公共服务器
+    ("华尔街见闻", "https://rsshub.app/wallstreetcn/global"),
+    ("财新网", "https://rsshub.app/caixin/latest"),
+]
 def guid_for(source, title, url):
     return hashlib.sha256(f"{source}|{title}|{url}".encode()).hexdigest()
 
