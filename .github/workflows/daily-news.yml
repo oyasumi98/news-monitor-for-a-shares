@@ -21,7 +21,20 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      
+
+            - name: 🔍 深度调试目录结构
+        run: |
+          echo "=== 1. 当前目录 ==="
+          pwd
+          echo "=== 2. 根目录下所有文件 ==="
+          ls -la
+          echo "=== 3. src 文件夹内部详情 ==="
+          ls -la src/
+          echo "=== 4. 检查 __init__.py 是否在里面 ==="
+          cat src/__init__.py || echo "警告：src里没有__init__.py！"
+          echo "=== 5. 检查是否有 src.py 捣乱 ==="
+          ls -la src.py 2>/dev/null && echo "危险：根目录有 src.py 文件！" || echo "安全，没有 src.py 干扰"
+          
       - name: 创建 .env 文件（从 Secrets 注入配置）
         run: |
           echo "DEEPSEEK_API_KEY=${{ secrets.DEEPSEEK_API_KEY }}" >> .env
