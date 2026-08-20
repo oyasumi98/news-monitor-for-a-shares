@@ -4,8 +4,27 @@ import feedparser
 from .db import init_db, insert_rss
 
 FEEDS = [
+    # 路透社
     ("Reuters World", "https://feeds.reuters.com/reuters/worldNews"),
     ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+    
+    # 新增：道琼斯/华尔街日报
+    ("WSJ Markets", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"),
+    
+    # 新增：金融时报
+    ("FT Home", "https://www.ft.com/rss/home"),
+    
+    # 新增：CNBC
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    
+    # 新增：彭博（Bloomberg 官方 RSS 可能需要特殊处理，以下地址可尝试）
+    ("Bloomberg Markets", "https://feeds.bloomberg.com/markets/news.rss"),
+    
+    # 新增：雅虎财经
+    ("Yahoo Finance", "https://finance.yahoo.com/rss/topstories"),
+    
+    # 如果想加入国内财经（部分可用）
+    # ("财新网", "https://rss.caixin.com/roll.xml"),
 ]
 
 def guid_for(source, title, url):
