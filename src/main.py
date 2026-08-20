@@ -2,8 +2,7 @@ from .rss_collector import collect
 from .scorer import run as score_run
 from .email_sender import send_email
 from .db import init_db
-from market_data import fetch_all_market_data, format_market_data_for_prompt
-
+from .market_data import fetch_all_market_data, format_market_data_for_prompt
 def main():
     init_db()
     collect()
