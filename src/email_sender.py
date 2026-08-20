@@ -11,7 +11,10 @@ def send_email():
         return
 
     parts = ["<html><body><h2>Global Market Event Radar</h2>"]
-    for i, r in enumerate(rows, 1):
+    for i, row in enumerate(rows, 1):
+        # ---- 关键修复：将 sqlite3.Row 转为普通字典 ----
+        r = dict(row)
+
         # ---- 安全转换数值字段 ----
         def to_float(val, default=0.0):
             try:
