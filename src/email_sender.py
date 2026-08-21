@@ -34,43 +34,44 @@ def send_email():
         direction_emoji = {"positive": "🟢", "negative": "🔴", "mixed": "🟡", "unknown": "⚪"}.get(direction, "⚪")
         direction_label = {"positive": "利好", "negative": "利空", "mixed": "混合", "unknown": "未知"}.get(direction, "未知")
 
-        # ---- 预期差 ----
-        exp_gap = r.get("expectation_gap", "unknown")
-        exp_gap_label = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}.get(exp_gap, "未知")
-        exp_gap_detail = r.get("expectation_gap_detail", "")
-
-        # ---- 解析强关联美股 ----
-        us_stocks = []
+        # ============================================================
+        # 关键修复：从 affected_assets JSON 中解析扩展信息
+        # ============================================================
+        affected_raw = r.get("affected_assets", "{}")
         try:
-            us_raw = r.get("strong_linked_us_stocks", "[]")
-            if isinstance(us_raw, str):
-                us_stocks = json.loads(us_raw) if us_raw else []
-            else:
-                us_stocks = us_raw if us_raw else []
+            extra = json.loads(affected_raw) if isinstance(affected_raw, str) else {}
         except:
-            us_stocks = []
+            extra = {}
 
-        # ---- 解析强关联A股 ----
-        a_stocks = []
-        try:
-            a_raw = r.get("strong_linked_a_stocks", "[]")
-            if isinstance(a_raw, str):
-                a_stocks = json.loads(a_raw) if a_raw else []
-            else:
-                a_stocks = a_raw if a_raw else []
-        except:
-            a_stocks = []
+        # ---- A股映射 ----
+        a_share = extra.get("a_share", {})
+        a_share_name = a_share.get("name", "")
+        a_share_ticker = a_share.get("ticker", "")
+        a_share_logic = a_share.get("logic", "")
+        a_share_directness = a_share.get("directness", "")
 
-        # ---- 解析价格异常 ----
-        price_anomaly = {}
-        try:
-            pa_raw = r.get("price_anomaly", "{}")
-            if isinstance(pa_raw, str):
-                price_anomaly = json.loads(pa_raw) if pa_raw else {}
-            else:
-                price_anomaly = pa_raw if pa_raw else {}
-        except:
-            price_anomaly = {}
+        # ---- 美股参考 ----
+        us_reference = extra.get("us_reference", [])
+
+        # ---- 预期差详细 ----
+        exp_gap_detail = extra.get("expectation_gap_detail", "")
+        exp_gap_label = {"high": "高", "medium": "中", "low": "低"}.get(
+            r.get("expectation_gap", "unknown"), "未知"
+        )
+
+        # ---- 催化剂 ----
+        key_catalysts = extra.get("key_catalysts", [])
+        catalysts_text = "\n".join(key_catalysts) if key_catalysts else ""
+
+        # ---- 未来情景 ----
+        future = extra.get("future_1_4_weeks", {})
+        base_case = future.get("base_case", "")
+        bull_case = future.get("bull_case", "")
+        bear_case = future.get("bear_case", "")
+
+        # ---- 市场反应 ----
+        market_price_reaction = extra.get("market_price_reaction", "")
+        market_mispricing = extra.get("market_mispricing", "")
 
         parts.append(f"""
         <hr>
@@ -83,49 +84,57 @@ def send_email():
         Sensitivity {sens:.0f}</p>
         <p><b>{direction_emoji} 方向：</b>{direction_label}</p>
         <p><b>📌 预期差：</b>{exp_gap_label} | {exp_gap_detail}</p>
-        <p><b>📌 发生了什么：</b>{r.get("news_summary", "")}</p>
-        <p><b>🔄 边际变化：</b>{r.get("marginal_change", "")}</p>
-        <p><b>为什么重要：</b>{r["rationale"]}</p>
-        <p><b>产业链逻辑：</b>{r.get("industry_chain_logic", "")}</p>
+        <p><b>📌 为什么重要：</b>{r["rationale"]}</p>
         """)
 
-        # 强关联美股（带逻辑）
-        if us_stocks:
-            stock_lines = []
-            for s in us_stocks:
-                ticker = s.get("ticker", "")
-                company = s.get("company", "")
-                rel = s.get("relationship", "")
-                logic = s.get("logic", "")
-                stock_lines.append(f"<b>{ticker}</b> ({company}) - {rel}: {logic}")
-            parts.append(f"<p><b>🇺🇸 强关联美股：</b><br>{'<br>'.join(stock_lines)}</p>")
-
-        # 强关联A股（带逻辑）
-        if a_stocks:
-            stock_lines = []
-            for s in a_stocks:
-                ticker = s.get("ticker", "")
-                company = s.get("company", "")
-                rel = s.get("relationship", "")
-                logic = s.get("logic", "")
-                stock_lines.append(f"<b>{ticker}</b> ({company}) - {rel}: {logic}")
-            parts.append(f"<p><b>🇨🇳 强关联A股：</b><br>{'<br>'.join(stock_lines)}</p>")
-
-        # 价格异常
-        if price_anomaly and price_anomaly.get("stock"):
+        # ---- A股映射（从 affected_assets 解析） ----
+        if a_share_name and a_share_ticker:
             parts.append(f"""
-            <p><b>📊 价格异常：</b>{price_anomaly.get('stock')} 
-            涨跌幅 {price_anomaly.get('change_pct', 0):.1f}% 
-            | 疑似原因：{price_anomaly.get('suspected_reason', '')}
-            | 置信度：{price_anomaly.get('confidence', 'unknown')}</p>
+            <p><b>🇨🇳 核心A股标的：</b>
+            <br><b>{a_share_ticker}</b> {a_share_name} 
+            <br>关联度：{a_share_directness}
+            <br>逻辑：{a_share_logic}</p>
             """)
 
-        # 催化剂
-        if r.get("validation_catalyst"):
-            parts.append(f"<p><b>⏰ 验证催化剂：</b>{r['validation_catalyst']}</p>")
+        # ---- 美股参考 ----
+        if us_reference:
+            us_lines = []
+            for ref in us_reference:
+                if isinstance(ref, dict):
+                    ticker = ref.get("ticker", "")
+                    company = ref.get("company", "")
+                    logic = ref.get("logic", "")
+                    us_lines.append(f"<b>{ticker}</b> ({company}): {logic}")
+                else:
+                    us_lines.append(str(ref))
+            parts.append(f"<p><b>🇺🇸 美股参考：</b><br>{'<br>'.join(us_lines)}</p>")
 
+        # ---- 产业链逻辑 ----
+        if r.get("industry_chain_logic"):
+            parts.append(f"<p><b>🔗 产业链逻辑：</b>{r.get('industry_chain_logic')}</p>")
+
+        # ---- 市场反应 ----
+        if market_price_reaction:
+            parts.append(f"<p><b>📊 市场反应：</b>{market_price_reaction}</p>")
+        if market_mispricing:
+            parts.append(f"<p><b>🎯 市场错误定价：</b>{market_mispricing}</p>")
+
+        # ---- 未来情景 ----
+        if any([base_case, bull_case, bear_case]):
+            parts.append(f"""
+            <p><b>🔮 未来1-4周情景：</b>
+            <br><b>基准：</b>{base_case}
+            <br><b>乐观：</b>{bull_case}
+            <br><b>悲观：</b>{bear_case}</p>
+            """)
+
+        # ---- 催化剂 ----
+        if catalysts_text:
+            parts.append(f"<p><b>⏰ 关键催化剂：</b><br>{catalysts_text}</p>")
+
+        # ---- 风险 ----
         parts.append(f"""
-        <p><b>风险：</b>{r["risks"]}</p>
+        <p><b>⚠️ 风险：</b>{r["risks"]}</p>
         <p><a href="{r["url"]}">查看原文</a></p>
         """)
 
