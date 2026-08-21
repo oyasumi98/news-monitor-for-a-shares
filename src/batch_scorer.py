@@ -1,5 +1,10 @@
-from .config import DB_PATH, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, GEMINI_API_KEY, GEMINI_MODEL, BATCH_LIMIT
+import sqlite3
+import json
+import requests
+from datetime import datetime, timedelta, timezone
+from .config import DB_PATH, BATCH_LIMIT, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, GEMINI_API_KEY, GEMINI_MODEL
 from .db import init_db
+from .llm_prompt import make_batch_prompt
 
 def get_unscored_news(limit=None):
     """
