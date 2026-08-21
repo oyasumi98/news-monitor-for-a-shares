@@ -262,31 +262,32 @@ def get_deepseek_client():
 
 
 def call_deepseek(prompt):
-    client = get_deepseek_client()
+    """使用 requests 调用 DeepSeek API（无需 openai 库）"""
+    import requests
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY 未设置")
 
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "你是一名严谨的全球宏观、"
-                    "科技产业和事件驱动投资研究员。"
-                    "必须严格按照用户要求输出JSON。"
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.1,
-        max_tokens=8000
+    r = requests.post(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"}
+        },
+        timeout=120
     )
-
-    return response.choices[0].message.content
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
 # ============================================================
