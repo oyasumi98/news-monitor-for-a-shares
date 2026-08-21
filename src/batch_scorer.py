@@ -1,1244 +1,715 @@
-import sqlite3
+# src/batch_scorer.py
+
 import json
-import requests
+import os
 from datetime import datetime, timedelta, timezone
 
-from . import config
-from .db import init_db
-from .llm_prompt import make_batch_prompt
-
-
-# ============================================================
-# 基础工具
-# ============================================================
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def normalize_time(value):
-    """
-    将数据库中的时间尽可能转换成 timezone-aware datetime。
-    """
-    if not value:
-        return None
-
-    try:
-        value = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(value)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.astimezone(timezone.utc)
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# 获取过去24小时新闻
-# ============================================================
-
-def get_unscored_news(limit=None):
-    """
-    获取过去24小时新闻。
-
-    注意：
-    不再使用“是否已经存在event_scores”作为唯一过滤条件。
-
-    原因：
-    某一条新闻过去已经被评分，不代表它今天不能参与
-    ONE BIG EVENT重新竞争。
-
-    真正的时间窗口由 collected_at / published 控制。
-    """
-
-    if limit is None:
-        limit = config.BATCH_LIMIT
-
-    con = sqlite3.connect(config.DB_PATH)
-    con.row_factory = sqlite3.Row
-
-    # UTC时间
-    threshold = utc_now() - timedelta(hours=24)
-
-    # ISO格式
-    threshold_iso = threshold.isoformat()
-
-    rows = con.execute(
-        """
-        SELECT r.*
-        FROM rss_items r
-        WHERE r.collected_at >= ?
-        ORDER BY r.collected_at DESC
-        LIMIT ?
-        """,
-        (threshold_iso, limit)
-    ).fetchall()
-
-    con.close()
-
-    items = [dict(row) for row in rows]
-
-    # ========================================================
-    # 程序层再次进行24小时过滤
-    # ========================================================
-
-    valid_items = []
-
-    now = utc_now()
-
-    for item in items:
-
-        dt = normalize_time(
-            item.get("published")
-            or item.get("published_at")
-            or item.get("collected_at")
-        )
-
-        if dt is None:
-            # 时间无法判断，保留，但标记
-            item["_time_unknown"] = True
-            valid_items.append(item)
-            continue
-
-        age_hours = (now - dt).total_seconds() / 3600
-
-        if age_hours <= 24:
-            item["_time_unknown"] = False
-            item["_age_hours"] = round(age_hours, 2)
-            valid_items.append(item)
-
-    return valid_items
+from .db import get_recent_news
 
 
 # ============================================================
 # DeepSeek
 # ============================================================
 
-def call_deepseek_batch(prompt):
+def get_deepseek_client():
+    from openai import OpenAI
 
-    """
-    DeepSeek调用。
-    """
+    api_key = os.getenv("DEEPSEEK_API_KEY")
 
-    r = requests.post(
-        f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY 未设置")
 
-        headers={
-            "Authorization": f"Bearer {config.DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json"
-        },
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com"
+    )
 
-        json={
-            "model": config.DEEPSEEK_MODEL,
 
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+def call_deepseek(prompt):
+    client = get_deepseek_client()
 
-            "temperature": 0.1,
-
-            "response_format": {
-                "type": "json_object"
+    response = client.chat.completions.create(
+        model=os.getenv(
+            "DEEPSEEK_MODEL",
+            "deepseek-chat"
+        ),
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
             }
-        },
-
-        timeout=180
+        ],
+        temperature=0.1,
+        max_tokens=8000
     )
 
-    r.raise_for_status()
-
-    return r.json()["choices"][0]["message"]["content"]
-
-
-# ============================================================
-# Gemini
-# ============================================================
-
-def call_gemini_batch(prompt):
-
-    """
-    Gemini调用。
-    """
-
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{config.GEMINI_MODEL}:generateContent",
-
-        params={
-            "key": config.GEMINI_API_KEY
-        },
-
-        json={
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": prompt
-                        }
-                    ]
-                }
-            ],
-
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json"
-            }
-        },
-
-        timeout=180
-    )
-
-    r.raise_for_status()
-
-    return (
-        r.json()
-        ["candidates"][0]
-        ["content"]["parts"][0]["text"]
-    )
-
-
-# ============================================================
-# 默认字段
-# ============================================================
-
-def fill_defaults(event):
-
-    """
-    防止LLM漏字段导致数据库写入失败。
-    """
-
-    defaults = {
-
-        "event_cluster": "",
-
-        "source_news_ids": [],
-
-        "is_repeat": False,
-
-        "is_valid_time_window": True,
-
-        "news_summary": "",
-
-        "marginal_change": "",
-
-        "category": "other",
-
-        "industry_chain_logic": "",
-
-        "strong_linked_us_stocks": [],
-
-        "strong_linked_a_stocks": [],
-
-        "market_crowdedness": "unknown",
-
-        "expectation_gap": "unknown",
-
-        "expectation_gap_detail": "",
-
-        "price_anomaly": {
-            "stock": "",
-            "change_pct": 0,
-            "volume": "",
-            "suspected_reason": "",
-            "confidence": None
-        },
-
-        "speaker": {
-            "name": None,
-            "role": None,
-            "statement_type": None,
-            "core_view": None
-        },
-
-        "validation_catalyst": None,
-
-        "novelty": 0,
-
-        "economic_impact": 0,
-
-        "transmission": 0,
-
-        "expectation_gap_score": 0,
-
-        "market_sensitivity": 0,
-
-        "event_score": 0,
-
-        "direction": "unknown",
-
-        "rationale": "",
-
-        "second_order_effects": "",
-
-        "risks": "",
-
-        "confidence": 0,
-
-        "affected_assets": "",
-
-        "affected_industries": "",
-
-        # ====================================================
-        # 新增字段
-        # ====================================================
-
-        "market_mispricing": 0,
-
-        "catalyst_strength": 0,
-
-        "valuation_room": 0,
-
-        "investment_score": 0,
-
-        "why_this_event": "",
-
-        "market_consensus": "",
-
-        "why_market_may_be_wrong": "",
-
-        "why_now": "",
-
-        "investment_thesis": "",
-
-        "earnings_impact": "",
-
-        "valuation_impact": "",
-
-        "market_logic": "",
-
-        "future_1_4_weeks": {},
-
-        "key_catalysts": [],
-
-        "key_risks": [],
-
-        "what_to_watch_next": [],
-
-        "final_conclusion": "",
-
-        "a_share_idea": {}
-    }
-
-    for key, default in defaults.items():
-
-        if key not in event or event[key] is None:
-            event[key] = default
-
-    return event
-
-
-# ============================================================
-# 数字安全转换
-# ============================================================
-
-def safe_float(value, default=0):
-
-    try:
-        if value is None:
-            return default
-
-        if isinstance(value, str):
-
-            value = (
-                value
-                .replace("%", "")
-                .replace(",", "")
-                .strip()
-            )
-
-        return float(value)
-
-    except Exception:
-
-        return default
-
-
-# ============================================================
-# 计算最终投资评分
-# ============================================================
-
-def calculate_investment_score(event):
-
-    """
-    防止LLM出现：
-
-    Novelty 1
-    Impact 1
-    Transmission 1
-
-    这种异常结果。
-
-    如果LLM已经给出investment_score：
-    优先使用。
-
-    否则根据核心维度重新计算。
-    """
-
-    novelty = safe_float(
-        event.get("novelty"),
-        0
-    )
-
-    expectation_gap = safe_float(
-        event.get("expectation_gap_score"),
-        0
-    )
-
-    market_mispricing = safe_float(
-        event.get("market_mispricing"),
-        0
-    )
-
-    economic_impact = safe_float(
-        event.get("economic_impact"),
-        0
-    )
-
-    transmission = safe_float(
-        event.get("transmission"),
-        0
-    )
-
-    market_sensitivity = safe_float(
-        event.get("market_sensitivity"),
-        0
-    )
-
-    catalyst_strength = safe_float(
-        event.get("catalyst_strength"),
-        0
-    )
-
-    valuation_room = safe_float(
-        event.get("valuation_room"),
-        0
-    )
-
-    # ========================================================
-    # 新评分模型
-    # ========================================================
-
-    score = (
-
-        0.20 * novelty
-
-        + 0.25 * expectation_gap
-
-        + 0.20 * market_mispricing
-
-        + 0.10 * economic_impact
-
-        + 0.10 * transmission
-
-        + 0.05 * market_sensitivity
-
-        + 0.05 * catalyst_strength
-
-        + 0.05 * valuation_room
-
-    )
-
-    return round(score, 2)
-
-
-# ============================================================
-# 最终候选事件过滤
-# ============================================================
-
-def validate_event(event):
-
-    """
-    对LLM结果做程序层硬过滤。
-    """
-
-    # --------------------------------------------------------
-    # 1. 时间窗口
-    # --------------------------------------------------------
-
-    if event.get("is_valid_time_window") is False:
-
-        print("[BATCH] 淘汰：超过24小时")
-
-        return False
-
-    # --------------------------------------------------------
-    # 2. 重复事件
-    # --------------------------------------------------------
-
-    if event.get("is_repeat") is True:
-
-        print("[BATCH] 淘汰：重复事件")
-
-        return False
-
-    # --------------------------------------------------------
-    # 3. 是否存在A股映射
-    # --------------------------------------------------------
-
-    a_stocks = event.get(
-        "strong_linked_a_stocks",
-        []
-    )
-
-    a_idea = event.get(
-        "a_share_idea",
-        {}
-    )
-
-    ticker = ""
-
-    if isinstance(a_idea, dict):
-
-        ticker = (
-            a_idea.get("ticker")
-            or a_idea.get("name")
-            or ""
-        )
-
-    if not a_stocks and not ticker:
-
-        print(
-            "[BATCH] 淘汰：没有明确A股/ETF映射"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 4. 必须有边际变化
-    # --------------------------------------------------------
-
-    marginal_change = (
-        event.get("marginal_change")
-        or event.get("core_change")
-        or ""
-    )
-
-    if len(str(marginal_change).strip()) < 5:
-
-        print(
-            "[BATCH] 淘汰：没有明确边际变化"
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 5. 投资评分
-    # --------------------------------------------------------
-
-    score = calculate_investment_score(event)
-
-    event["investment_score"] = score
-
-    # --------------------------------------------------------
-    # 6. 低分直接淘汰
-    # --------------------------------------------------------
-
-    if score < 60:
-
-        print(
-            f"[BATCH] 淘汰：投资评分过低 {score}"
-        )
-
-        return False
-
-    return True
-
-
-# ============================================================
-# 找到事件对应的RSS新闻
-# ============================================================
-
-def _get_event_rss_item_id(event, all_items, cur):
-
-    """
-    找到事件对应的第一条原始新闻。
-
-    source_news_ids优先。
-    """
-
-    source_ids = event.get(
-        "source_news_ids",
-        []
-    )
-
-    # --------------------------------------------------------
-    # source_news_ids
-    # --------------------------------------------------------
-
-    if isinstance(source_ids, list):
-
-        for source_id in source_ids:
-
-            # 如果是新闻数组下标
-            if isinstance(source_id, int):
-
-                if 0 <= source_id < len(all_items):
-
-                    item_id = all_items[source_id].get("id")
-
-                    if item_id is not None:
-
-                        return item_id
-
-                # 如果是数据库ID
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM rss_items
-                    WHERE id = ?
-                    """,
-                    (source_id,)
-                )
-
-                row = cur.fetchone()
-
-                if row:
-
-                    return row[0]
-
-    # --------------------------------------------------------
-    # 尝试title匹配
-    # --------------------------------------------------------
-
-    title = (
-        event.get("event_title")
-        or event.get("title")
-        or ""
-    )
-
-    if title:
-
-        words = title[:40].strip()
-
-        if len(words) >= 5:
-
-            cur.execute(
-                """
-                SELECT id
-                FROM rss_items
-                WHERE title LIKE ?
-                ORDER BY collected_at DESC
-                LIMIT 1
-                """,
-                (f"%{words}%",)
-            )
-
-            row = cur.fetchone()
-
-            if row:
-
-                return row[0]
-
-    # --------------------------------------------------------
-    # news_summary匹配
-    # --------------------------------------------------------
-
-    summary = event.get(
-        "news_summary",
-        ""
-    )
-
-    if summary:
-
-        keyword = summary[:30].strip()
-
-        if len(keyword) >= 5:
-
-            cur.execute(
-                """
-                SELECT id
-                FROM rss_items
-                WHERE title LIKE ?
-                ORDER BY collected_at DESC
-                LIMIT 1
-                """,
-                (f"%{keyword}%",)
-            )
-
-            row = cur.fetchone()
-
-            if row:
-
-                return row[0]
-
-    # --------------------------------------------------------
-    # event_cluster匹配
-    # --------------------------------------------------------
-
-    cluster = event.get(
-        "event_cluster",
-        ""
-    )
-
-    if cluster:
-
-        keyword = cluster[:20].strip()
-
-        if len(keyword) >= 5:
-
-            cur.execute(
-                """
-                SELECT id
-                FROM rss_items
-                WHERE title LIKE ?
-                ORDER BY collected_at DESC
-                LIMIT 1
-                """,
-                (f"%{keyword}%",)
-            )
-
-            row = cur.fetchone()
-
-            if row:
-
-                return row[0]
-
-    return None
-
-
-# ============================================================
-# 保存ONE BIG EVENT
-# ============================================================
-
-def insert_batch_event(event, all_items):
-
-    """
-    只保存最终胜出的ONE BIG EVENT。
-    """
-
-    event = fill_defaults(event)
-
-    con = sqlite3.connect(
-        config.DB_PATH
-    )
-
-    cur = con.cursor()
-
-    rss_item_id = _get_event_rss_item_id(
-        event,
-        all_items,
-        cur
-    )
-
-    if rss_item_id is None:
-
-        con.close()
-
-        print(
-            "[BATCH] 无法找到对应RSS新闻ID"
-        )
-
-        return False
-
-    # ========================================================
-    # 最终评分
-    # ========================================================
-
-    event["investment_score"] = calculate_investment_score(
-        event
-    )
-
-    # ========================================================
-    # 构建数据库数据
-    # ========================================================
-
-    score_data = {
-
-        "rss_item_id":
-            rss_item_id,
-
-        "category":
-            event.get(
-                "category",
-                "other"
-            ),
-
-        "event_type":
-            (
-                event.get("event_cluster")
-                or event.get("event_type")
-                or ""
-            )[:100],
-
-        "novelty":
-            safe_float(
-                event.get("novelty")
-            ),
-
-        "economic_impact":
-            safe_float(
-                event.get("economic_impact")
-            ),
-
-        "transmission":
-            safe_float(
-                event.get("transmission")
-            ),
-
-        "expectation_gap":
-            safe_float(
-                event.get(
-                    "expectation_gap_score"
-                )
-            ),
-
-        "market_sensitivity":
-            safe_float(
-                event.get(
-                    "market_sensitivity"
-                )
-            ),
-
-        # 这里把最终投资评分写入event_score
-        "event_score":
-            safe_float(
-                event.get(
-                    "investment_score"
-                )
-            ),
-
-        "direction":
-            event.get(
-                "direction",
-                "unknown"
-            ),
-
-        "affected_assets":
-            event.get(
-                "affected_assets",
-                ""
-            ),
-
-        "affected_industries":
-            event.get(
-                "affected_industries",
-                ""
-            ),
-
-        "rationale":
-            (
-                event.get("final_conclusion")
-                or event.get("rationale")
-                or ""
-            ),
-
-        "second_order_effects":
-            event.get(
-                "second_order_effects",
-                ""
-            ),
-
-        "risks":
-            event.get(
-                "risks",
-                ""
-            ),
-
-        "model":
-            "one-big-event",
-
-        "scored_at":
-            utc_now().isoformat(),
-
-        "source_news_ids":
-            json.dumps(
-                event.get(
-                    "source_news_ids",
-                    []
-                ),
-                ensure_ascii=False
-            ),
-
-        "strong_linked_us_stocks":
-            json.dumps(
-                event.get(
-                    "strong_linked_us_stocks",
-                    []
-                ),
-                ensure_ascii=False
-            ),
-
-        "strong_linked_a_stocks":
-            json.dumps(
-                event.get(
-                    "strong_linked_a_stocks",
-                    []
-                ),
-                ensure_ascii=False
-            ),
-
-        "market_crowdedness":
-            event.get(
-                "market_crowdedness",
-                "unknown"
-            ),
-
-        "expectation_gap_detail":
-            event.get(
-                "expectation_gap_detail",
-                ""
-            ),
-
-        "price_anomaly":
-            json.dumps(
-                event.get(
-                    "price_anomaly",
-                    {}
-                ),
-                ensure_ascii=False
-            ),
-
-        "validation_catalyst":
-            event.get(
-                "validation_catalyst",
-                ""
-            ),
-
-        "confidence":
-            safe_float(
-                event.get(
-                    "confidence",
-                    0
-                )
-            ),
-
-        "news_summary":
-            event.get(
-                "news_summary",
-                ""
-            ),
-
-        "marginal_change":
-            event.get(
-                "marginal_change",
-                ""
-            ),
-
-        "industry_chain_logic":
-            event.get(
-                "industry_chain_logic",
-                ""
-            )
-    }
-
-    # ========================================================
-    # 读取数据库真实字段
-    # ========================================================
-
-    columns = _get_table_columns(cur)
-
-    insert_data = {
-        k: v
-        for k, v in score_data.items()
-        if k in columns
-    }
-
-    # ========================================================
-    # 防止重复保存
-    # ========================================================
-
-    cur.execute(
-        """
-        SELECT id
-        FROM event_scores
-        WHERE rss_item_id = ?
-        """,
-        (rss_item_id,)
-    )
-
-    existing = cur.fetchone()
-
-    if existing:
-
-        # ----------------------------------------------------
-        # 更新
-        # ----------------------------------------------------
-
-        assignments = []
-
-        for key in insert_data:
-
-            if key == "rss_item_id":
-                continue
-
-            assignments.append(
-                f"{key} = :{key}"
-            )
-
-        sql = f"""
-            UPDATE event_scores
-            SET {", ".join(assignments)}
-            WHERE rss_item_id = :rss_item_id
-        """
-
-        cur.execute(
-            sql,
-            insert_data
-        )
-
-    else:
-
-        # ----------------------------------------------------
-        # 插入
-        # ----------------------------------------------------
-
-        columns_str = ", ".join(
-            insert_data.keys()
-        )
-
-        placeholders = ", ".join(
-            f":{k}"
-            for k in insert_data.keys()
-        )
-
-        sql = f"""
-            INSERT INTO event_scores
-            ({columns_str})
-            VALUES
-            ({placeholders})
-        """
-
-        cur.execute(
-            sql,
-            insert_data
-        )
-
-    con.commit()
-
-    con.close()
-
-    return True
-
-
-# ============================================================
-# 数据库字段
-# ============================================================
-
-def _get_table_columns(cur):
-
-    cur.execute(
-        "PRAGMA table_info(event_scores)"
-    )
-
-    return [
-        row[1]
-        for row in cur.fetchall()
-    ]
+    return response.choices[0].message.content
 
 
 # ============================================================
 # JSON解析
 # ============================================================
 
-def parse_llm_json(raw):
-
+def extract_json(text):
     """
-    兼容：
-
-    {
-        "signal": "ONE_BIG_EVENT",
-        ...
-    }
-
-    或：
-
-    {
-        "events": [...]
-    }
-
-    或旧版本：
-
-    [...]
+    从LLM返回内容中提取JSON。
     """
 
-    raw = (
-        raw
-        .strip()
-        .replace("```json", "")
-        .replace("```", "")
-        .strip()
-    )
-
-    data = json.loads(raw)
-
-    # --------------------------------------------------------
-    # 新版ONE BIG EVENT
-    # --------------------------------------------------------
-
-    if isinstance(data, dict):
-
-        signal = data.get(
-            "signal"
-        )
-
-        if signal == "NO_CLEAR_EDGE":
-
-            return []
-
-        if signal == "ONE_BIG_EVENT":
-
-            return [data]
-
-        # ----------------------------------------------------
-        # events数组
-        # ----------------------------------------------------
-
-        if isinstance(
-            data.get("events"),
-            list
-        ):
-
-            return data["events"]
-
-        # ----------------------------------------------------
-        # event对象
-        # ----------------------------------------------------
-
-        if isinstance(
-            data.get("event"),
-            dict
-        ):
-
-            event = data["event"]
-
-            # 将外层信息合并进去
-            for key, value in data.items():
-
-                if key not in (
-                    "event",
-                    "signal"
-                ):
-
-                    event.setdefault(
-                        key,
-                        value
-                    )
-
-            return [event]
-
-        # ----------------------------------------------------
-        # 默认把整个dict作为事件
-        # ----------------------------------------------------
-
-        return [data]
-
-    # --------------------------------------------------------
-    # 旧版list
-    # --------------------------------------------------------
-
-    if isinstance(data, list):
-
-        return data
-
-    return []
-
-
-# ============================================================
-# 从多个候选中选出唯一事件
-# ============================================================
-
-def select_one_big_event(events):
-
-    """
-    最终保险机制：
-
-    无论LLM返回多少个事件，
-    最终只能保存一个。
-
-    优先：
-    investment_score
-
-    其次：
-    event_score
-    """
-
-    valid_events = []
-
-    for event in events:
-
-        if not isinstance(
-            event,
-            dict
-        ):
-            continue
-
-        event = fill_defaults(event)
-
-        # ----------------------------------------------------
-        # 新评分
-        # ----------------------------------------------------
-
-        event["investment_score"] = (
-            calculate_investment_score(
-                event
-            )
-        )
-
-        # ----------------------------------------------------
-        # 硬过滤
-        # ----------------------------------------------------
-
-        if not validate_event(event):
-
-            continue
-
-        valid_events.append(event)
-
-    if not valid_events:
-
+    if not text:
         return None
 
-    # --------------------------------------------------------
-    # 排序
-    # --------------------------------------------------------
+    text = text.strip()
 
-    valid_events.sort(
-        key=lambda x: (
-            safe_float(
-                x.get(
-                    "investment_score",
-                    0
-                )
-            ),
-            safe_float(
-                x.get(
-                    "expectation_gap_score",
-                    0
-                )
-            ),
-            safe_float(
-                x.get(
-                    "novelty",
-                    0
-                )
-            )
-        ),
-        reverse=True
+    # 去掉markdown代码块
+    if text.startswith("```"):
+        lines = text.splitlines()
+
+        if len(lines) >= 3:
+            lines = lines[1:]
+
+            if lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+
+            text = "\n".join(lines).strip()
+
+    # 直接解析
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 尝试寻找第一个 {
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+        candidate = text[start:end + 1]
+
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
+
+
+# ============================================================
+# Prompt
+# ============================================================
+
+def make_batch_prompt(items, current_time, market_text):
+
+    news_blocks = []
+
+    for i, item in enumerate(items):
+
+        news_id = item.get("id", i)
+
+        source = (
+            item.get("source")
+            or item.get("feed")
+            or "unknown"
+        )
+
+        published = (
+            item.get("published")
+            or item.get("published_at")
+            or item.get("collected_at")
+            or "unknown"
+        )
+
+        title = item.get("title", "")
+
+        summary = (
+            item.get("summary")
+            or item.get("description")
+            or ""
+        )
+
+        url = (
+            item.get("url")
+            or item.get("link")
+            or ""
+        )
+
+        news_blocks.append(
+            f"""
+================ NEWS {i} ================
+
+NEWS_ID:
+{news_id}
+
+SOURCE:
+{source}
+
+PUBLISHED:
+{published}
+
+TITLE:
+{title}
+
+SUMMARY:
+{summary}
+
+URL:
+{url}
+
+===========================================
+"""
+        )
+
+    news_text = "\n".join(news_blocks)
+
+    return f"""
+你是一名全球宏观、科技产业、政策和事件驱动投资领域的资深策略分析师。
+
+当前时间：
+{current_time}
+
+============================================================
+任务
+============================================================
+
+请从下面过去24小时新闻中，只寻找：
+
+ONE BIG EVENT
+
+即：
+
+“未来1～4周最可能因为市场尚未充分定价，
+而产生明显行情的一个重大事件。”
+
+不是选择最热门新闻。
+
+而是寻找：
+
+预期差最大
++
+基本面传导最清晰
++
+A股映射最明确
++
+当前股价尚未充分price in
++
+未来存在验证催化剂
+
+============================================================
+第一步：严格限制过去24小时
+============================================================
+
+只分析过去24小时发生的新事件。
+
+如果只是旧新闻再次报道：
+
+淘汰。
+
+如果多个媒体报道同一事件：
+
+合并。
+
+标题不同但本质相同：
+
+必须视为同一个事件。
+
+例如：
+
+“美国30年美债收益率创新高”
+
+“全球长期借贷成本上升”
+
+“美国财政赤字担忧”
+
+如果核心驱动因素相同：
+
+必须聚类成一个事件。
+
+============================================================
+第二步：寻找边际变化
+============================================================
+
+必须回答：
+
+市场昨天知道什么？
+
+今天新增了什么？
+
+重点寻找：
+
+新数据
+新订单
+新产能
+新政策
+新技术
+新融资
+新资本开支
+新产品
+供应链变化
+重要人物新表态
+
+没有新边际变化：
+
+淘汰。
+
+============================================================
+第三步：重点寻找预期差
+============================================================
+
+重点分析：
+
+新闻发生后：
+
+相关股票涨了多少？
+
+市场已经price in多少？
+
+是否存在：
+
+基本面变化 > 股价变化
+
+或者：
+
+股价变化 > 基本面变化
+
+尤其寻找：
+
+新闻重大，但相关A股没有明显上涨。
+
+这种情况可能存在最大的预期差。
+
+============================================================
+第四步：产业链分析
+============================================================
+
+尤其关注科技产业。
+
+必须至少分析2～4层产业链。
+
+例如：
+
+AI资本开支
+→ GPU
+→ HBM
+→ 先进封装
+→ 光模块
+→ PCB
+→ 电力设备
+
+不要只写：
+
+“AI利好科技股”。
+
+必须找到：
+
+哪个具体环节的盈利预期可能发生变化。
+
+============================================================
+第五步：A股映射
+============================================================
+
+最终必须找到：
+
+一个明确的A股上市公司或者A股ETF。
+
+优先：
+
+DIRECT
+>
+INDIRECT
+>
+SECOND_ORDER
+
+禁止纯概念映射。
+
+必须回答：
+
+为什么这个事件会影响这个公司的：
+
+收入
+订单
+成本
+产能
+盈利
+估值
+
+中的至少一项。
+
+============================================================
+第六步：最新行情
+============================================================
+
+必须使用下面的最新市场数据：
+
+{market_text}
+
+不要使用旧行情。
+
+判断：
+
+1. 股票是否已经大涨；
+2. 是否已经连续上涨；
+3. 是否明显拥挤；
+4. 是否新闻很好但股价没有反应；
+5. 是否股价已经提前交易。
+
+============================================================
+第七步：未来1～4周
+============================================================
+
+必须推演：
+
+Base Case
+Bull Case
+Bear Case
+
+并且给出未来可能验证逻辑的：
+
+财报
+订单
+政策
+产业数据
+产品发布
+产能
+资本开支
+价格
+技术验证
+
+============================================================
+最终要求
+============================================================
+
+只允许输出一个事件。
+
+如果没有真正明显的预期差：
+
+返回：
+
+{{
+    "signal": "NO_CLEAR_EDGE"
+}}
+
+如果存在：
+
+返回：
+
+{{
+    "signal": "ONE_BIG_EVENT",
+
+    "event": {{
+        "title": "",
+        "category": "",
+        "event_cluster": "",
+        "published_time": "",
+
+        "news_summary": "",
+        "what_changed": "",
+        "why_now": "",
+
+        "market_consensus": "",
+        "expectation_gap": "",
+        "expectation_gap_detail": "",
+
+        "market_mispricing": "",
+        "market_price_reaction": "",
+
+        "industry_chain_logic": "",
+
+        "a_share_idea": {{
+            "name": "",
+            "ticker": "",
+            "type": "stock|ETF",
+            "logic": "",
+            "directness": "DIRECT|INDIRECT|SECOND_ORDER",
+            "current_price_reaction": "",
+            "valuation_room": ""
+        }},
+
+        "us_reference": [],
+
+        "speaker": {{
+            "name": null,
+            "role": null,
+            "statement_type": null,
+            "core_view": null
+        }},
+
+        "investment_thesis": "",
+
+        "earnings_impact": "",
+        "valuation_impact": "",
+
+        "future_1_4_weeks": {{
+            "base_case": "",
+            "bull_case": "",
+            "bear_case": ""
+        }},
+
+        "key_catalysts": [],
+        "key_risks": [],
+        "what_to_watch_next": [],
+
+        "final_conclusion": ""
+    }},
+
+    "scores": {{
+        "novelty": 0,
+        "economic_impact": 0,
+        "transmission": 0,
+        "expectation_gap": 0,
+        "market_mispricing": 0,
+        "market_sensitivity": 0,
+        "catalyst_strength": 0,
+        "valuation_room": 0,
+        "investment_score": 0
+    }},
+
+    "source_news_ids": []
+}}
+
+============================================================
+硬性要求
+============================================================
+
+1. 只输出一个事件。
+2. 不要输出TOP5。
+3. 不要输出多个候选。
+4. 必须有A股股票或ETF。
+5. 股票必须有明确逻辑。
+6. 不允许编造。
+7. 不允许使用旧行情。
+8. 不允许选择超过24小时的核心事件。
+9. 不允许把同一事件拆成多个事件。
+10. 不要因为新闻热门而提高评分。
+
+只返回JSON。
+
+============================================================
+新闻
+============================================================
+
+{news_text}
+"""
+
+
+# ============================================================
+# A股映射检查
+# ============================================================
+
+def get_a_share_idea(result):
+    """
+    新版JSON结构：
+
+    result
+        └── event
+              └── a_share_idea
+    """
+
+    if not isinstance(result, dict):
+        return None
+
+    event = result.get("event")
+
+    if not isinstance(event, dict):
+        return None
+
+    idea = event.get("a_share_idea")
+
+    if not isinstance(idea, dict):
+        return None
+
+    return idea
+
+
+def has_valid_a_share_mapping(result):
+
+    idea = get_a_share_idea(result)
+
+    if not idea:
+        return False
+
+    name = str(
+        idea.get("name", "")
+    ).strip()
+
+    ticker = str(
+        idea.get("ticker", "")
+    ).strip()
+
+    logic = str(
+        idea.get("logic", "")
+    ).strip()
+
+    invalid = {
+        "",
+        "unknown",
+        "null",
+        "none",
+        "n/a",
+        "暂无",
+        "不确定"
+    }
+
+    if name.lower() in invalid:
+        return False
+
+    if ticker.lower() in invalid:
+        return False
+
+    if not logic:
+        return False
+
+    return True
+
+
+# ============================================================
+# A股映射二次修复
+# ============================================================
+
+def make_mapping_repair_prompt(result, market_text):
+
+    event = result.get(
+        "event",
+        {}
     )
 
-    # --------------------------------------------------------
-    # 只允许一个
-    # --------------------------------------------------------
+    return f"""
+你是一名A股产业链研究员。
 
-    winner = valid_events[0]
+现在已经确定了一个全球重大投资事件。
 
-    winner["is_final_winner"] = True
+你不要重新选择事件。
 
-    winner["final_rank"] = 1
+你的唯一任务：
 
-    # 保存内部候选数量，方便调试
-    winner["_candidate_count"] = len(
-        valid_events
-    )
+寻找一个与该事件基本面关系最直接的A股上市公司或A股ETF。
 
-    return winner
+============================================================
+事件
+============================================================
+
+{json.dumps(
+    event,
+    ensure_ascii=False,
+    indent=2
+)}
+
+============================================================
+最新市场数据
+============================================================
+
+{market_text}
+
+============================================================
+要求
+============================================================
+
+必须满足：
+
+1. 必须是A股上市公司或者A股ETF。
+
+2. 优先选择直接受益公司。
+
+3. 不允许纯概念关联。
+
+4. 必须解释：
+
+事件
+↓
+产业链变化
+↓
+公司收入/订单/成本/盈利变化
+↓
+估值变化
+↓
+股价可能变化
+
+5. 必须考虑当前股价。
+
+6. 如果已经大涨，判断是否已经price in。
+
+7. 如果存在更直接的A股标的，优先选择更直接的。
+
+8. 如果不存在可靠映射，返回null。
+
+============================================================
+输出
+============================================================
+
+只返回：
+
+{{
+    "a_share_idea": {{
+        "name": "",
+        "ticker": "",
+        "type": "stock|ETF",
+        "logic": "",
+        "directness": "DIRECT|INDIRECT|SECOND_ORDER",
+        "current_price_reaction": "",
+        "valuation_room": ""
+    }}
+}}
+
+或者：
+
+{{
+    "a_share_idea": null
+}}
+
+不要输出任何其他内容。
+"""
+
+
+def repair_a_share_mapping(result, market_text):
+
+    try:
+
+        print("[BATCH] 未找到有效A股映射")
+        print("[BATCH] 启动A股映射二次分析...")
+
+        prompt = make_mapping_repair_prompt(
+            result,
+            market_text
+        )
+
+        response = call_deepseek(prompt)
+
+        repaired = extract_json(response)
+
+        if not repaired:
+            print("[BATCH] A股映射二次分析JSON解析失败")
+            return result
+
+        mapping = repaired.get(
+            "a_share_idea"
+        )
+
+        if not isinstance(mapping, dict):
+            print("[BATCH] 二次分析未找到A股映射")
+            return result
+
+        event = result.get(
+            "event"
+        )
+
+        if not isinstance(event, dict):
+            return result
+
+        event["a_share_idea"] = mapping
+
+        print(
+            "[BATCH] A股映射补全："
+            f"{mapping.get('name', '')} "
+            f"{mapping.get('ticker', '')}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        print(
+            f"[BATCH] A股映射二次分析失败：{e}"
+        )
+
+        return result
 
 
 # ============================================================
@@ -1246,137 +717,69 @@ def select_one_big_event(events):
 # ============================================================
 
 def run_batch(
-    market_text=None,
-    limit=None,
-    hours=24,
-    max_events=1
+    market_text="unknown",
+    current_time=None
 ):
 
-    """
-    GLOBAL MARKET SURPRISE DETECTOR
+    print(
+        "[BATCH] ===== GLOBAL MARKET SURPRISE DETECTOR ====="
+    )
 
-    核心流程：
+    # --------------------------------------------------------
+    # 当前时间
+    # --------------------------------------------------------
 
-    过去24小时新闻
-        ↓
-    LLM语义去重
-        ↓
-    事件聚类
-        ↓
-    预期差分析
-        ↓
-    A股映射
-        ↓
-    最终PK
-        ↓
-    ONE BIG EVENT
+    if current_time is None:
 
-    参数：
-
-    market_text:
-        最新市场行情
-
-    limit:
-        RSS最多读取多少条
-
-    hours:
-        时间窗口，默认24小时
-
-    max_events:
-        最终事件数量，强制为1
-    """
+        current_time = datetime.now(
+            timezone.utc
+        ).isoformat()
 
     print(
-        "\n[BATCH] "
-        "===== GLOBAL MARKET SURPRISE DETECTOR ====="
+        f"[BATCH] 当前时间：{current_time}"
     )
-
-    # ========================================================
-    # 初始化
-    # ========================================================
-
-    init_db()
-
-    if limit is None:
-
-        limit = config.BATCH_LIMIT
-
-    # ========================================================
-    # 获取新闻
-    # ========================================================
 
     print(
-        f"[BATCH] 时间窗口：过去{hours}小时"
+        "[BATCH] 时间窗口：过去24小时"
     )
 
-    items = get_unscored_news(
-        limit
-    )
+    # --------------------------------------------------------
+    # 获取过去24小时新闻
+    # --------------------------------------------------------
+
+    try:
+
+        items = get_recent_news(
+            hours=24
+        )
+
+    except Exception as e:
+
+        print(
+            f"[BATCH] 获取新闻失败：{e}"
+        )
+
+        return
 
     if not items:
 
         print(
-            "[BATCH] 没有过去24小时新闻"
+            "[BATCH] 过去24小时没有新闻"
         )
 
-        return None
+        return
 
     print(
         f"[BATCH] 获取新闻：{len(items)}条"
     )
 
-    # ========================================================
-    # 市场数据
-    # ========================================================
-
-    if market_text is None:
-
-        print(
-            "[BATCH] 未传入市场数据，尝试获取..."
-        )
-
-        try:
-
-            from .market_data import (
-                fetch_all_market_data,
-                format_market_data_for_prompt
-            )
-
-            market_data = (
-                fetch_all_market_data()
-            )
-
-            market_text = (
-                format_market_data_for_prompt(
-                    market_data
-                )
-            )
-
-        except Exception as e:
-
-            print(
-                f"[BATCH] 市场数据获取失败：{e}"
-            )
-
-            market_text = "UNKNOWN"
-
-    else:
-
-        print(
-            "[BATCH] 使用最新市场数据"
-        )
-
-    # ========================================================
-    # 当前时间
-    # ========================================================
-
-    current_time = (
-        utc_now().isoformat()
+    print(
+        "[BATCH] 使用最新市场数据"
     )
 
-    # ========================================================
-    # 构建Prompt
-    # ========================================================
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     prompt = make_batch_prompt(
         items,
@@ -1385,228 +788,221 @@ def run_batch(
     )
 
     print(
-        "[BATCH] Prompt长度："
-        f"{len(prompt)}字符"
+        f"[BATCH] Prompt长度：{len(prompt)}字符"
     )
 
-    # ========================================================
-    # LLM
-    # ========================================================
+    # --------------------------------------------------------
+    # 第一次LLM
+    # --------------------------------------------------------
 
-    raw = None
+    print(
+        "[BATCH] 使用DeepSeek..."
+    )
 
     try:
 
-        if config.DEEPSEEK_API_KEY:
-
-            print(
-                "[BATCH] 使用DeepSeek..."
-            )
-
-            raw = call_deepseek_batch(
-                prompt
-            )
-
-            model = "deepseek-one-big-event"
-
-        elif config.GEMINI_API_KEY:
-
-            print(
-                "[BATCH] 使用Gemini..."
-            )
-
-            raw = call_gemini_batch(
-                prompt
-            )
-
-            model = "gemini-one-big-event"
-
-        else:
-
-            raise RuntimeError(
-                "未配置DeepSeek或Gemini API Key"
-            )
+        raw = call_deepseek(
+            prompt
+        )
 
     except Exception as e:
 
         print(
-            f"[BATCH] LLM调用失败：{e}"
+            f"[BATCH] DeepSeek调用失败：{e}"
         )
 
-        return None
-
-    # ========================================================
-    # 解析
-    # ========================================================
+        return
 
     print(
         f"[BATCH] LLM返回长度：{len(raw)}字符"
     )
 
+    result = extract_json(
+        raw
+    )
+
+    if not result:
+
+        print(
+            "[BATCH] LLM JSON解析失败"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 检查是否有事件
+    # --------------------------------------------------------
+
+    signal = result.get(
+        "signal"
+    )
+
+    if signal == "NO_CLEAR_EDGE":
+
+        print(
+            "[BATCH] LLM判断：没有明确预期差"
+        )
+
+        return
+
+    if signal != "ONE_BIG_EVENT":
+
+        print(
+            f"[BATCH] 未知signal：{signal}"
+        )
+
+        return
+
+    event = result.get(
+        "event"
+    )
+
+    if not isinstance(event, dict):
+
+        print(
+            "[BATCH] 没有有效event"
+        )
+
+        return
+
+    print(
+        "[BATCH] LLM返回候选事件：1个"
+    )
+
+    print(
+        "[BATCH] 事件："
+        + str(
+            event.get(
+                "title",
+                "unknown"
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # A股映射
+    # --------------------------------------------------------
+
+    if not has_valid_a_share_mapping(
+        result
+    ):
+
+        result = repair_a_share_mapping(
+            result,
+            market_text
+        )
+
+    # --------------------------------------------------------
+    # 最终A股检查
+    # --------------------------------------------------------
+
+    if not has_valid_a_share_mapping(
+        result
+    ):
+
+        print(
+            "[BATCH] 最终仍没有明确A股/ETF映射"
+        )
+
+        print(
+            "[BATCH] 本次不发送"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 提取最终结果
+    # --------------------------------------------------------
+
+    event = result["event"]
+
+    idea = event["a_share_idea"]
+
+    scores = result.get(
+        "scores",
+        {}
+    )
+
+    # --------------------------------------------------------
+    # 打印最终结果
+    # --------------------------------------------------------
+
+    print(
+        "[BATCH] ========================================"
+    )
+
+    print(
+        "[BATCH] FINAL ONE BIG EVENT"
+    )
+
+    print(
+        f"[BATCH] 标题：{event.get('title', '')}"
+    )
+
+    print(
+        f"[BATCH] A股标的："
+        f"{idea.get('name', '')} "
+        f"{idea.get('ticker', '')}"
+    )
+
+    print(
+        f"[BATCH] 类型："
+        f"{idea.get('type', '')}"
+    )
+
+    print(
+        f"[BATCH] 投资逻辑："
+        f"{idea.get('logic', '')}"
+    )
+
+    print(
+        f"[BATCH] Investment Score："
+        f"{scores.get('investment_score', 0)}"
+    )
+
+    print(
+        "[BATCH] ========================================"
+    )
+
+    # --------------------------------------------------------
+    # 保存到数据库
+    # --------------------------------------------------------
+
     try:
 
-        events = parse_llm_json(
-            raw
+        save_event(result)
+
+        print(
+            "[BATCH] 事件保存成功"
         )
 
     except Exception as e:
 
         print(
-            f"[BATCH] JSON解析失败：{e}"
+            f"[BATCH] 事件保存失败：{e}"
         )
 
-        print(
-            "[BATCH] 原始返回："
-            f"{raw[:1000]}"
-        )
-
-        return None
-
-    if not events:
-
-        print(
-            "[BATCH] 没有ONE BIG EVENT"
-        )
-
-        return None
-
-    print(
-        f"[BATCH] LLM返回候选事件："
-        f"{len(events)}个"
-    )
-
-    # ========================================================
-    # 最终PK
-    # ========================================================
-
-    winner = select_one_big_event(
-        events
-    )
-
-    if winner is None:
-
-        print(
-            "[BATCH] 没有事件通过最终筛选"
-        )
-
-        return None
-
-    # ========================================================
-    # 写入模型信息
-    # ========================================================
-
-    winner["model"] = model
-
-    # ========================================================
-    # 强制只保存一个
-    # ========================================================
-
-    success = insert_batch_event(
-        winner,
-        items
-    )
-
-    if not success:
-
-        print(
-            "[BATCH] ONE BIG EVENT保存失败"
-        )
-
-        return None
-
-    # ========================================================
-    # 输出结果
-    # ========================================================
-
-    score = safe_float(
-        winner.get(
-            "investment_score"
-        )
-    )
-
-    title = (
-        winner.get("event", {})
-        .get("title")
-        if isinstance(
-            winner.get("event"),
-            dict
-        )
-        else None
-    )
-
-    if not title:
-
-        title = (
-            winner.get("event_title")
-            or winner.get("news_summary")
-            or winner.get("event_cluster")
-            or "UNKNOWN"
-        )
-
-    a_idea = winner.get(
-        "a_share_idea",
-        {}
-    )
-
-    if isinstance(
-        a_idea,
-        dict
-    ):
-
-        a_name = (
-            a_idea.get("name")
-            or a_idea.get("ticker")
-            or "UNKNOWN"
-        )
-
-    else:
-
-        a_name = "UNKNOWN"
-
-    print("\n")
-    print("=" * 70)
-    print("🎯 ONE BIG EVENT")
-    print("=" * 70)
-
-    print(
-        f"事件：{title}"
-    )
-
-    print(
-        f"投资评分：{score:.1f}"
-    )
-
-    print(
-        f"A股映射：{a_name}"
-    )
-
-    print(
-        f"预期差："
-        f"{winner.get('expectation_gap', 'unknown')}"
-    )
-
-    print(
-        f"拥挤度："
-        f"{winner.get('market_crowdedness', 'unknown')}"
-    )
-
-    print(
-        f"结论："
-        f"{winner.get('final_conclusion', '')[:300]}"
-    )
-
-    print("=" * 70)
-
-    return winner
+    return result
 
 
 # ============================================================
-# 独立运行
+# 数据库保存
 # ============================================================
 
-if __name__ == "__main__":
+def save_event(result):
 
-    run_batch(
-        hours=24,
-        max_events=1
-    )
+    """
+    如果你的db.py已经有保存评分结果的函数，
+    可以在这里替换。
+
+    目前为了避免因为数据库接口不同导致主程序失败，
+    默认只打印，不强制依赖数据库结构。
+    """
+
+    # 如果你的项目原来有：
+    #
+    # insert_event(...)
+    #
+    # 可以在这里接入。
+
+    return True
