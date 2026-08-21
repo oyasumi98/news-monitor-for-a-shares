@@ -22,3 +22,15 @@ MAIL_FROM = os.getenv("MAIL_FROM", "") or SMTP_USER
 
 MIN_SCORE_TO_EMAIL = float(os.getenv("MIN_SCORE_TO_EMAIL", "75"))
 MAX_EMAIL_EVENTS = int(os.getenv("MAX_EMAIL_EVENTS", "10"))
+# ============================================================
+# 批量评分配置
+# ============================================================
+
+# 批量评分每次处理的新闻数量上限
+# 建议值：200-500，取决于你的RSS源数量和API上下文窗口
+# DeepSeek上下文窗口较大，可以设置500；Gemini建议300
+BATCH_LIMIT = 300
+
+# 如果担心token超限，可以启用时间窗口过滤
+# 只处理过去24小时内的新闻
+BATCH_TIME_WINDOW_HOURS = 24
