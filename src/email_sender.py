@@ -1,9 +1,10 @@
 import smtplib
+import json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from .config import *
 from .db import get_recent_scored
-import json
+
 
 def send_email():
     rows = get_recent_scored(MIN_SCORE_TO_EMAIL, MAX_EMAIL_EVENTS)
@@ -28,9 +29,18 @@ def send_email():
         gap = to_float(r.get("expectation_gap"))
         sens = to_float(r.get("market_sensitivity"))
 
-        # ---- 解析强关联股票 ----
+        # ---- 方向（利好/利空） ----
+        direction = r.get("direction", "unknown")
+        direction_emoji = {"positive": "🟢", "negative": "🔴", "mixed": "🟡", "unknown": "⚪"}.get(direction, "⚪")
+        direction_label = {"positive": "利好", "negative": "利空", "mixed": "混合", "unknown": "未知"}.get(direction, "未知")
+
+        # ---- 预期差 ----
+        exp_gap = r.get("expectation_gap", "unknown")
+        exp_gap_label = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}.get(exp_gap, "未知")
+        exp_gap_detail = r.get("expectation_gap_detail", "")
+
+        # ---- 解析强关联美股 ----
         us_stocks = []
-        a_stocks = []
         try:
             us_raw = r.get("strong_linked_us_stocks", "[]")
             if isinstance(us_raw, str):
@@ -40,6 +50,8 @@ def send_email():
         except:
             us_stocks = []
 
+        # ---- 解析强关联A股 ----
+        a_stocks = []
         try:
             a_raw = r.get("strong_linked_a_stocks", "[]")
             if isinstance(a_raw, str):
@@ -49,7 +61,7 @@ def send_email():
         except:
             a_stocks = []
 
-        # ---- 解析 price_anomaly ----
+        # ---- 解析价格异常 ----
         price_anomaly = {}
         try:
             pa_raw = r.get("price_anomaly", "{}")
@@ -69,13 +81,15 @@ def send_email():
         Transmission {trans:.0f};
         Expectation Gap {gap:.0f};
         Sensitivity {sens:.0f}</p>
-        <p><b>📌 发生了什么：</b>{r["news_summary"]}</p>
-        <p><b>🔄 边际变化：</b>{r["marginal_change"]}</p>
+        <p><b>{direction_emoji} 方向：</b>{direction_label}</p>
+        <p><b>📌 预期差：</b>{exp_gap_label} | {exp_gap_detail}</p>
+        <p><b>📌 发生了什么：</b>{r.get("news_summary", "")}</p>
+        <p><b>🔄 边际变化：</b>{r.get("marginal_change", "")}</p>
         <p><b>为什么重要：</b>{r["rationale"]}</p>
-        <p><b>产业链逻辑：</b>{r["industry_chain_logic"]}</p>
+        <p><b>产业链逻辑：</b>{r.get("industry_chain_logic", "")}</p>
         """)
 
-        # 强关联美股
+        # 强关联美股（带逻辑）
         if us_stocks:
             stock_lines = []
             for s in us_stocks:
@@ -86,7 +100,7 @@ def send_email():
                 stock_lines.append(f"<b>{ticker}</b> ({company}) - {rel}: {logic}")
             parts.append(f"<p><b>🇺🇸 强关联美股：</b><br>{'<br>'.join(stock_lines)}</p>")
 
-        # 强关联A股
+        # 强关联A股（带逻辑）
         if a_stocks:
             stock_lines = []
             for s in a_stocks:
@@ -114,7 +128,7 @@ def send_email():
         <p><b>风险：</b>{r["risks"]}</p>
         <p><a href="{r["url"]}">查看原文</a></p>
         """)
-    
+
     parts.append("</body></html>")
 
     msg = MIMEMultipart("alternative")
@@ -127,6 +141,7 @@ def send_email():
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
     print(f"[MAIL] sent {len(rows)} events")
+
 
 if __name__ == "__main__":
     send_email()
