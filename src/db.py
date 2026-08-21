@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import requests
 from datetime import datetime, timezone, timedelta
 
 from .config import DB_PATH
@@ -15,7 +16,6 @@ def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # rss_items 表
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rss_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +30,6 @@ def init_db():
         )
     """)
 
-    # event_scores 表（包含 direction 字段）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS event_scores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +54,6 @@ def init_db():
         )
     """)
 
-    # 索引
     cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_rss_item ON event_scores(rss_item_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_score ON event_scores(event_score)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_scored_at ON event_scores(scored_at)")
@@ -67,11 +65,10 @@ def init_db():
 
 
 # ============================================================
-# 插入RSS新闻
+# 插入函数
 # ============================================================
 
 def insert_rss(item):
-    """插入RSS新闻到 rss_items 表"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -92,12 +89,7 @@ def insert_rss(item):
     con.close()
 
 
-# ============================================================
-# 插入评分
-# ============================================================
-
 def insert_score(rss_item_id, score_data):
-    """插入评分到 event_scores 表"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -130,16 +122,10 @@ def insert_score(rss_item_id, score_data):
     con.close()
 
 
-# ============================================================
-# 获取最近评分的事件（供邮件发送）
-# ============================================================
-
 def get_recent_scored(min_score=60, limit=10):
-    """获取评分 >= min_score 的事件，按评分降序排列"""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
-
     rows = cur.execute("""
         SELECT 
             e.*,
@@ -150,77 +136,48 @@ def get_recent_scored(min_score=60, limit=10):
         ORDER BY e.event_score DESC, e.scored_at DESC
         LIMIT ?
     """, (min_score, limit)).fetchall()
-
     con.close()
     return [dict(row) for row in rows]
 
 
 # ============================================================
-# 1. 获取过去24小时RSS新闻
+# 获取过去24小时新闻
 # ============================================================
 
 def get_recent_news(hours=24):
-    """
-    从rss_items中获取过去24小时新闻。
-    优先使用 published，无法解析时使用 collected_at。
-    """
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
-
     rows = cur.execute("""
-        SELECT
-            id,
-            guid,
-            published,
-            source,
-            title,
-            url,
-            summary,
-            content,
-            collected_at
+        SELECT id, guid, published, source, title, url, summary, content, collected_at
         FROM rss_items
         ORDER BY id DESC
     """).fetchall()
-
     con.close()
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=hours)
-
     result = []
-
     for row in rows:
-
         item = dict(row)
-
         dt = parse_datetime(item.get("published"))
         if dt is None:
             dt = parse_datetime(item.get("collected_at"))
-
         if dt is None:
             continue
-
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-
         dt = dt.astimezone(timezone.utc)
-
         if dt < cutoff:
             continue
-
         result.append(item)
-
     return result
 
 
 def parse_datetime(value):
-    """兼容RSS常见时间格式"""
     if not value:
         return None
-
     value = str(value).strip()
-
     formats = [
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%dT%H:%M:%S.%fZ",
@@ -229,78 +186,54 @@ def parse_datetime(value):
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
     ]
-
     for fmt in formats:
         try:
             return datetime.strptime(value, fmt)
         except Exception:
             pass
-
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         pass
-
     return None
 
 
 # ============================================================
-# 2. DeepSeek 调用
+# DeepSeek 调用（使用 requests）
 # ============================================================
 
-def get_deepseek_client():
-    from openai import OpenAI
-
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY 未设置")
-
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com"
-    )
-
-
 def call_deepseek(prompt):
-    """使用 requests 调用 DeepSeek API（无需 openai 库）"""
-    import requests
-
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY 未设置")
-
     model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-    r = requests.post(
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 8000
+    }
+    resp = requests.post(
         f"{base_url}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"}
-        },
+        headers=headers,
+        json=payload,
         timeout=120
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
-
-# ============================================================
-# 3. JSON解析
-# ============================================================
 
 def extract_json(text):
     if not text:
         return None
-
     text = text.strip()
-
-    # 去掉markdown代码块
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3:
@@ -308,70 +241,43 @@ def extract_json(text):
             if lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-
-    # 直接解析
     try:
         return json.loads(text)
     except Exception:
         pass
-
-    # 从第一个 { 到最后一个 }
     start = text.find("{")
     end = text.rfind("}")
-
     if start >= 0 and end > start:
-        candidate = text[start:end + 1]
         try:
-            return json.loads(candidate)
+            return json.loads(text[start:end+1])
         except Exception:
             pass
-
     return None
 
 
 # ============================================================
-# 4. 批量提示词（ONE BIG EVENT）
+# 构建批量提示词（多事件候选）
 # ============================================================
 
 def make_batch_prompt(items, current_time, market_text):
     news_blocks = []
-
     for i, item in enumerate(items):
-        news_blocks.append(
-            f"""
+        news_blocks.append(f"""
 ================ NEWS {i} ================
 
-NEWS_ID:
-{item.get("id", "")}
-
-SOURCE:
-{item.get("source", "")}
-
-PUBLISHED:
-{item.get("published", "")}
-
-TITLE:
-{item.get("title", "")}
-
-SUMMARY:
-{item.get("summary", "")}
-
-CONTENT:
-{item.get("content", "")[:3000]}
-
-URL:
-{item.get("url", "")}
+NEWS_ID: {item.get("id", "")}
+SOURCE: {item.get("source", "")}
+PUBLISHED: {item.get("published", "")}
+TITLE: {item.get("title", "")}
+SUMMARY: {item.get("summary", "")}
+CONTENT: {item.get("content", "")[:3000]}
+URL: {item.get("url", "")}
 
 ===========================================
-"""
-        )
-
+""")
     news_text = "\n".join(news_blocks)
 
-    return f"""
-def make_batch_prompt(items, current_time, market_text):
-    # ... 前面的 news_blocks 构建保持不变 ...
-
+    # 使用多行字符串，注意内部不再包含三重引号，所有 JSON 示例使用单行或转义
     return f"""
 你是一名全球宏观、科技产业、政策和事件驱动投资领域的资深策略分析师。
 
@@ -381,47 +287,21 @@ def make_batch_prompt(items, current_time, market_text):
 你的核心任务
 ============================================================
 
-从过去24小时新闻中，识别出：
-
-**所有具有潜在预期差的事件**
-
+从过去24小时新闻中，识别出所有具有潜在预期差的事件。
 不限制数量，但最多输出10个。
 
-============================================================
-筛选标准（按重要性排序）
-============================================================
+筛选标准（按重要性排序）：
+1. 预期差：市场定价 vs 事件实际含义的差距（最重要）
+2. 边际变化：相比昨天，今天发生了什么新的事实
+3. 产业链传导：能否影响至少2层产业链
+4. A股映射：是否能够映射到明确的A股标的
 
-1. **预期差**：市场定价 vs 事件实际含义的差距（最重要）
-2. **边际变化**：相比昨天，今天发生了什么新的事实
-3. **产业链传导**：能否影响至少2层产业链
-4. **A股映射**：是否能够映射到明确的A股标的
-
-============================================================
-重点关注“异常”信号
-============================================================
-
-以下情况应给予更高权重：
-
-1. **价格异常**：
-   - 某股票突然大涨/大跌，但没有对应的重大新闻
-   - 某板块集体异动，但市场解读不充分
-
-2. **基本面异常**：
-   - 冷门行业公司突然获得大订单
-   - 长期低迷的产业链出现反转信号
-   - 小众技术突然获得巨头认可
-
-3. **政策异常**：
-   - 原本不可能的政策方向突然松动
-   - 小范围试点突然扩大为全面政策
-
-4. **人物言论异常**：
-   - 一贯保守的官员/CEO突然释放激进信号
-   - 同行中第一个改变观点的关键人物
-
-5. **产业链异常**：
-   - 上游产能突然收缩/扩张
-   - 核心供应商的客户结构突然变化
+重点关注"异常"信号：
+- 价格异常：某股票突然大涨/大跌但没有对应新闻
+- 基本面异常：冷门行业公司突然获得大订单
+- 政策异常：原本不可能的政策方向突然松动
+- 人物言论异常：一贯保守的官员/CEO突然释放激进信号
+- 产业链异常：上游产能突然收缩/扩张
 
 ============================================================
 输出格式（最多10个事件）
@@ -431,26 +311,26 @@ def make_batch_prompt(items, current_time, market_text):
     "signal": "MULTIPLE_CANDIDATES",
     "candidates": [
         {{
-            "title": "",
-            "category": "",
-            "news_summary": "",
-            "what_changed": "",
+            "title": "事件标题",
+            "category": "macro|policy|technology|company|industry_chain|market_event",
+            "news_summary": "一句话总结",
+            "what_changed": "发生了什么边际变化",
             "expectation_gap": "high|medium|low",
-            "expectation_gap_detail": "",
+            "expectation_gap_detail": "具体预期差描述",
             "abnormality_score": 0-100,
-            "abnormality_reason": "",
+            "abnormality_reason": "为什么认为异常",
             "a_share_idea": {{
-                "name": "",
-                "ticker": "",
+                "name": "公司名称",
+                "ticker": "股票代码",
                 "type": "stock|ETF",
-                "logic": "",
+                "logic": "投资逻辑",
                 "directness": "DIRECT|INDIRECT|SECOND_ORDER"
             }},
             "us_reference": [],
-            "industry_chain_logic": "",
-            "investment_thesis": "",
-            "key_risks": [],
-            "catalyst_timeline": ""
+            "industry_chain_logic": "产业链传导",
+            "investment_thesis": "投资要点",
+            "key_risks": ["风险1", "风险2"],
+            "catalyst_timeline": "未来催化剂时间"
         }}
     ]
 }}
@@ -465,7 +345,7 @@ def make_batch_prompt(items, current_time, market_text):
 1. 最多输出10个事件，按预期差从高到低排序
 2. 只包含有明确A股映射的事件
 3. 如果某事件已经被市场充分定价，排除
-4. 不要只输出“最大”的新闻，要输出“最异常”的新闻
+4. 不要只输出"最大"的新闻，要输出"最异常"的新闻
 5. 只返回JSON
 
 ============================================================
@@ -477,274 +357,108 @@ def make_batch_prompt(items, current_time, market_text):
 
 
 # ============================================================
-# 5. A股映射检查
+# 保存单个事件
 # ============================================================
 
-def get_a_share_idea(result):
-    if not isinstance(result, dict):
-        return None
-
-    event = result.get("event")
-    if not isinstance(event, dict):
-        return None
-
-    idea = event.get("a_share_idea")
-    if not isinstance(idea, dict):
-        return None
-
-    return idea
-
-
-def has_valid_a_share_mapping(result):
-    idea = get_a_share_idea(result)
-    if not idea:
-        return False
-
-    name = str(idea.get("name", "")).strip()
-    ticker = str(idea.get("ticker", "")).strip()
-    logic = str(idea.get("logic", "")).strip()
-
-    if not name or not ticker or not logic:
-        return False
-
-    invalid = {"unknown", "null", "none", "n/a", "暂无", "不确定"}
-    if name.lower() in invalid or ticker.lower() in invalid:
-        return False
-
-    return True
-
-
-# ============================================================
-# 6. A股映射二次补全
-# ============================================================
-
-def make_mapping_repair_prompt(result, market_text):
-    event = result.get("event", {})
-
-    return f"""
-你是一名A股产业链首席研究员。
-
-现在已经确定了下面这个全球重大事件。
-
-不要重新选择事件。
-
-你的唯一任务：
-
-寻找一个与事件基本面联系最直接的：
-
-A股上市公司
-
-或者
-
-A股ETF。
-
-============================================================
-事件
-============================================================
-
-{json.dumps(event, ensure_ascii=False, indent=2)}
-
-============================================================
-最新市场行情
-============================================================
-
-{market_text}
-
-============================================================
-要求
-============================================================
-
-必须判断：
-
-1. 事件是否真正影响这个公司/ETF；
-
-2. 影响的是：
-
-收入
-订单
-成本
-利润
-资本开支
-估值
-
-中的哪一个；
-
-3. 产业链传导路径；
-
-4. 当前股票是否已经price in；
-
-5. 未来1～4周是否还有上涨空间。
-
-优先：
-
-直接受益
-
-其次：
-
-间接受益
-
-最后：
-
-二阶受益
-
-禁止纯概念。
-
-如果没有可靠A股映射：
-
-返回null。
-
-============================================================
-输出
-============================================================
-
-{{
-    "a_share_idea": {{
-
-        "name": "",
-        "ticker": "",
-        "type": "stock|ETF",
-
-        "logic": "",
-
-        "directness": "DIRECT|INDIRECT|SECOND_ORDER",
-
-        "current_price_reaction": "",
-
-        "valuation_room": ""
-
-    }}
-}}
-
-或者：
-
-{{
-    "a_share_idea": null
-}}
-
-只返回JSON。
-"""
-
-
-def repair_a_share_mapping(result, market_text):
-    print("[BATCH] 启动A股映射二次分析...")
-
-    try:
-        prompt = make_mapping_repair_prompt(result, market_text)
-        raw = call_deepseek(prompt)
-        repaired = extract_json(raw)
-
-        if not repaired:
-            print("[BATCH] A股映射二次分析JSON解析失败")
-            return result
-
-        mapping = repaired.get("a_share_idea")
-        if not isinstance(mapping, dict):
-            print("[BATCH] 二次分析没有找到A股映射")
-            return result
-
-        event = result.get("event")
-        if not isinstance(event, dict):
-            return result
-
-        event["a_share_idea"] = mapping
-        print(f"[BATCH] A股映射补全：{mapping.get('name', '')} {mapping.get('ticker', '')}")
-
-        return result
-
-    except Exception as e:
-        print(f"[BATCH] A股映射二次分析失败：{e}")
-        return result
-
-
-# ============================================================
-# 7. 保存ONE BIG EVENT（修正版）
-# ============================================================
-
-def save_one_big_event(result):
-    """
-    把新版ONE BIG EVENT转换成现有event_scores表结构。
-    使用 insert_score 代替不存在的 insert_batch_events。
-    """
-    event = result.get("event", {})
-    scores = result.get("scores", {})
-    idea = event.get("a_share_idea", {})
-
-    # 获取源新闻ID
-    source_ids = event.get("source_news_ids", [])
-    rss_item_id = None
-    if source_ids:
-        try:
-            rss_item_id = int(source_ids[0])
-        except Exception:
-            pass
-
-    if rss_item_id is None:
-        print("[BATCH] 没有有效source_news_id，跳过数据库保存")
-        return
-
-    # 构建评分数据（使用现有字段）
+def save_single_event(event, rss_item_id):
+    """将单个候选事件存入数据库"""
     score_data = {
         "category": event.get("category", "other"),
-        "event_type": event.get("event_cluster", ""),
-        "novelty": scores.get("novelty", 0),
-        "economic_impact": scores.get("fundamental_impact", 0),
-        "transmission": scores.get("transmission", 0),
-        "expectation_gap": scores.get("expectation_gap", 50),
-        "market_sensitivity": scores.get("market_mispricing", 0),
-        "event_score": scores.get("investment_score", 0),
-        "direction": event.get("direction", "unknown"),  # 从事件中读取方向
+        "event_type": event.get("title", "")[:100],
+        "novelty": event.get("abnormality_score", 0),
+        "economic_impact": 50,  # 由LLM未明确给出，给个中性值
+        "transmission": 50,
+        "expectation_gap": 50,
+        "market_sensitivity": 50,
+        "event_score": event.get("abnormality_score", 0),  # 直接用异常分作为总分
+        "direction": "unknown",
         "affected_assets": json.dumps({
-            "a_share": idea,
+            "a_share": event.get("a_share_idea", {}),
             "us_reference": event.get("us_reference", []),
             "expectation_gap_detail": event.get("expectation_gap_detail", ""),
-            "market_price_reaction": event.get("market_price_reaction", ""),
-            "market_mispricing": event.get("market_mispricing", ""),
-            "key_catalysts": event.get("key_catalysts", []),
-            "future_1_4_weeks": event.get("future_1_4_weeks", {})
+            "industry_chain_logic": event.get("industry_chain_logic", ""),
+            "key_risks": event.get("key_risks", []),
+            "catalyst_timeline": event.get("catalyst_timeline", "")
         }, ensure_ascii=False),
         "affected_industries": event.get("category", ""),
         "rationale": event.get("investment_thesis", ""),
-        "second_order_effects": event.get("future_1_4_weeks", {}).get("base_case", ""),
+        "second_order_effects": "",
         "risks": "\n".join(event.get("key_risks", [])),
-        "model": "deepseek-one-big-event",
+        "model": "deepseek-multi-candidate",
         "scored_at": datetime.now(timezone.utc).isoformat()
     }
-
-    # 调用已有的 insert_score
     insert_score(rss_item_id, score_data)
-    print(f"[BATCH] ONE BIG EVENT 已保存数据库，A股：{idea.get('name', '')} ({idea.get('ticker', '')})")
+    print(f"[BATCH] 保存事件：{event.get('title', '')[:50]} (评分：{event.get('abnormality_score', 0)})")
 
 
 # ============================================================
-# 8. 主函数：run_batch
+# 主函数
 # ============================================================
+
 def run_batch(market_text="unknown"):
-    # ... 前面的代码保持不变 ...
+    print("[BATCH] ===== GLOBAL MARKET SURPRISE DETECTOR =====")
+    init_db()
 
+    now = datetime.now(timezone.utc)
+    print(f"[BATCH] 当前UTC时间：{now.isoformat()}")
+    items = get_recent_news(hours=24)
+    print(f"[BATCH] 获取新闻：{len(items)}条")
+    if not items:
+        print("[BATCH] 没有新闻")
+        return None
+
+    if market_text != "unknown":
+        print("[BATCH] 使用最新市场数据")
+    else:
+        print("[BATCH] 市场数据不可用")
+
+    prompt = make_batch_prompt(items, now.isoformat(), market_text)
+    print(f"[BATCH] Prompt长度：{len(prompt)}字符")
+
+    print("[BATCH] 调用DeepSeek...")
+    try:
+        raw = call_deepseek(prompt)
+    except Exception as e:
+        print(f"[BATCH] DeepSeek调用失败：{e}")
+        return None
+
+    print(f"[BATCH] LLM返回长度：{len(raw)}字符")
     result = extract_json(raw)
+    if not result:
+        print("[BATCH] JSON解析失败")
+        return None
 
     if result.get("signal") == "NO_CLEAR_EDGE":
-        print("[BATCH] 今天没有足够大的预期差")
+        print("[BATCH] 没有识别到有预期差的事件")
         return None
 
     if result.get("signal") != "MULTIPLE_CANDIDATES":
-        print("[BATCH] LLM返回格式异常")
+        print("[BATCH] 信号格式异常，预期 MULTIPLE_CANDIDATES")
         return None
 
     candidates = result.get("candidates", [])
-    print(f"[BATCH] LLM返回 {len(candidates)} 个候选事件")
+    if not candidates:
+        print("[BATCH] 候选列表为空")
+        return None
 
-    # 按异常程度排序
+    print(f"[BATCH] 共识别出 {len(candidates)} 个候选事件")
+    # 按异常分排序
     candidates.sort(key=lambda x: x.get("abnormality_score", 0), reverse=True)
 
-    for idx, event in enumerate(candidates):
-        # 每个事件单独保存到数据库
-        # 使用相同的 save_one_big_event 但传入单个事件
-        score = event.get("scores", {}).get("investment_score", 0)
-        print(f"[BATCH] {idx+1}. {event['title'][:50]}... (评分: {score})")
+    # 保存每个事件
+    for idx, evt in enumerate(candidates):
+        # 从原始新闻列表中匹配一个 news_id（取第一个来源）
+        # 简单起见，我们只取第一个新闻的ID
+        # 在真实场景中，可以匹配更精准，这里简化
+        rss_item_id = None
+        if items:
+            # 取第一条新闻ID（或按标题匹配，这里取第一条）
+            rss_item_id = items[0].get("id")
+        if rss_item_id is None:
+            print(f"[BATCH] 跳过保存，无关联新闻ID：{evt.get('title', '')[:30]}")
+            continue
+        save_single_event(evt, rss_item_id)
+        print(f"[BATCH] {idx+1}. {evt.get('title', '')[:60]} - 异常分：{evt.get('abnormality_score', 0)}")
 
-        # 保存每个事件
-        save_single_event(event)
-
+    print("[BATCH] 所有事件已保存")
     return result
-
