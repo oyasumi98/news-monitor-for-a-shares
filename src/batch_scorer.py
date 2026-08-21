@@ -1,3 +1,10 @@
+import sqlite3
+import json
+import requests
+from datetime import datetime, timedelta, timezone
+from .config import DB_PATH, BATCH_LIMIT, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, GEMINI_API_KEY, GEMINI_MODEL
+from .db import init_db
+from .llm_prompt import make_batch_prompt
 def run_batch(market_text=None, limit=None):
     """
     批量评分：把所有新闻发给LLM，让LLM聚类去重
@@ -8,8 +15,8 @@ def run_batch(market_text=None, limit=None):
     """
     print("[BATCH] ===== 进入 run_batch 函数 =====")
     
-    if limit is None:
-        limit = BATCH_LIMIT
+if limit is None:
+        limit = config.BATCH_LIMIT  # 加上 config.
     print(f"[BATCH] 本次处理上限: {limit} 条")
     
     # 1. 获取未评分的新闻
