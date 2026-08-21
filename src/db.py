@@ -66,7 +66,68 @@ def init_db():
     con.close()
     print("[DB] 数据库初始化完成")
 
+# ============================================================
+# 插入RSS新闻
+# ============================================================
 
+def insert_rss(item):
+    """插入RSS新闻到 rss_items 表"""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO rss_items (
+            guid, published, source, title, url, summary, content, collected_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        item.get("guid", ""),
+        item.get("published", ""),
+        item.get("source", ""),
+        item.get("title", ""),
+        item.get("url", ""),
+        item.get("summary", ""),
+        item.get("content", ""),
+        item.get("collected_at", "")
+    ))
+    con.commit()
+    con.close()
+
+
+# ============================================================
+# 插入评分
+# ============================================================
+
+def insert_score(rss_item_id, score_data):
+    """插入评分到 event_scores 表"""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO event_scores (
+            rss_item_id, category, event_type, novelty, economic_impact,
+            transmission, expectation_gap, market_sensitivity, event_score,
+            direction, affected_assets, affected_industries, rationale,
+            second_order_effects, risks, model, scored_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rss_item_id,
+        score_data.get("category", "other"),
+        score_data.get("event_type", ""),
+        score_data.get("novelty", 0),
+        score_data.get("economic_impact", 0),
+        score_data.get("transmission", 0),
+        score_data.get("expectation_gap", 50),
+        score_data.get("market_sensitivity", 0),
+        score_data.get("event_score", 0),
+        score_data.get("direction", "unknown"),
+        score_data.get("affected_assets", ""),
+        score_data.get("affected_industries", ""),
+        score_data.get("rationale", ""),
+        score_data.get("second_order_effects", ""),
+        score_data.get("risks", ""),
+        score_data.get("model", "deepseek"),
+        score_data.get("scored_at", "")
+    ))
+    con.commit()
+    con.close()
 # ============================================================
 # 1. 获取过去24小时RSS新闻
 # ============================================================
