@@ -369,419 +369,104 @@ URL:
     news_text = "\n".join(news_blocks)
 
     return f"""
+def make_batch_prompt(items, current_time, market_text):
+    # ... 前面的 news_blocks 构建保持不变 ...
+
+    return f"""
 你是一名全球宏观、科技产业、政策和事件驱动投资领域的资深策略分析师。
 
-当前时间：
-
-{current_time}
+当前时间：{current_time}
 
 ============================================================
-你的唯一任务
+你的核心任务
 ============================================================
 
-从过去24小时新闻中：
+从过去24小时新闻中，识别出：
 
-只寻找一个：
+**所有具有潜在预期差的事件**
 
-ONE BIG EVENT
-
-也就是：
-
-未来1～4周最可能产生明显资产价格变化，
-并且目前仍然存在明显预期差的一个事件。
-
-不是选择最热门新闻。
-
-不是选择新闻影响最大新闻。
-
-而是寻找：
-
-“市场还没有充分定价的重大边际变化”。
+不限制数量，但最多输出10个。
 
 ============================================================
-一、严格过去24小时
+筛选标准（按重要性排序）
 ============================================================
 
-只能使用过去24小时发生的事件。
-
-超过24小时：
-
-不得作为核心事件。
-
-旧新闻今天再次报道：
-
-不得视为新事件。
+1. **预期差**：市场定价 vs 事件实际含义的差距（最重要）
+2. **边际变化**：相比昨天，今天发生了什么新的事实
+3. **产业链传导**：能否影响至少2层产业链
+4. **A股映射**：是否能够映射到明确的A股标的
 
 ============================================================
-二、严格事件去重
+重点关注“异常”信号
 ============================================================
 
-不同媒体报道同一事件：
+以下情况应给予更高权重：
 
-必须合并。
+1. **价格异常**：
+   - 某股票突然大涨/大跌，但没有对应的重大新闻
+   - 某板块集体异动，但市场解读不充分
 
-例如：
+2. **基本面异常**：
+   - 冷门行业公司突然获得大订单
+   - 长期低迷的产业链出现反转信号
+   - 小众技术突然获得巨头认可
 
-美国30年期美债收益率上升
+3. **政策异常**：
+   - 原本不可能的政策方向突然松动
+   - 小范围试点突然扩大为全面政策
 
-美国财政赤字担忧
+4. **人物言论异常**：
+   - 一贯保守的官员/CEO突然释放激进信号
+   - 同行中第一个改变观点的关键人物
 
-全球长期融资成本上升
-
-如果本质由同一个核心驱动因素导致：
-
-必须视为一个EVENT CLUSTER。
-
-不能分别输出。
-
-============================================================
-三、最重要：寻找边际变化
-============================================================
-
-重点寻找：
-
-新数据
-新订单
-新产品
-新技术
-新实验结果
-新产能
-新资本开支
-新融资
-新政策
-新监管
-重要人物最新表态
-产业链供需变化
-
-必须回答：
-
-市场原来知道什么？
-
-过去24小时新增了什么？
-
-这个新增信息为什么可能改变未来盈利或者估值？
+5. **产业链异常**：
+   - 上游产能突然收缩/扩张
+   - 核心供应商的客户结构突然变化
 
 ============================================================
-四、特别关注科技产业链
+输出格式（最多10个事件）
 ============================================================
-
-重点寻找：
-
-AI
-半导体
-先进封装
-HBM
-光模块
-服务器
-数据中心
-电力
-机器人
-自动驾驶
-云计算
-软件
-新能源
-生物科技
-
-但不限于上述行业。
-
-必须至少推演：
-
-事件
-→
-产业链
-→
-具体公司
-→
-盈利
-
-至少两层。
-
-============================================================
-五、必须结合最新市场行情
-============================================================
-
-以下是最新市场数据：
-
-{market_text}
-
-必须考虑：
-
-1. 最新股票涨跌幅；
-2. 最近几日表现；
-3. 是否已经明显上涨；
-4. 是否已经充分price in；
-5. 新闻和股价是否存在背离。
-
-最值得关注的是：
-
-“基本面发生重大变化，
-但股票还没有充分反映。”
-
-============================================================
-六、A股映射
-============================================================
-
-最终必须找到：
-
-一个明确A股股票或者ETF。
-
-优先级：
-
-DIRECT
->
-INDIRECT
->
-SECOND_ORDER
-
-禁止纯概念股。
-
-必须说明：
-
-事件
-→
-产业链变化
-→
-公司业务变化
-→
-收入/订单/成本/盈利
-→
-估值
-→
-股价
-
-如果一个公司无法建立完整逻辑：
-
-不要选择。
-
-ETF也可以。
-
-例如：
-
-某个产业发生系统性变化，
-但没有单一公司能够代表，
-可以选择对应行业ETF。
-
-============================================================
-七、重要人物
-============================================================
-
-如果过去24小时存在重要人物讲话：
-
-例如：
-
-企业CEO
-科技公司创始人
-央行官员
-财政官员
-知名投资人
-产业专家
-
-如果其观点对：
-
-基本面
-产业链
-资本开支
-技术路线
-
-有实质影响：
-
-必须考虑。
-
-但是：
-
-普通评论不要纳入。
-
-============================================================
-八、未来1～4周
-============================================================
-
-必须推演：
-
-BASE CASE
-
-BULL CASE
-
-BEAR CASE
-
-以及未来可能验证逻辑的：
-
-财报
-订单
-政策
-产业数据
-产品发布
-产能
-价格
-资本开支
-技术验证
-
-============================================================
-九、最终评分
-============================================================
-
-重点不是新闻本身重要程度。
-
-而是：
-
-“市场尚未定价程度”。
-
-investment_score：
-
-40% expectation_gap
-
-20% fundamental_impact
-
-15% transmission
-
-15% market_mispricing
-
-10% catalyst_strength
-
-如果：
-
-新闻很重要，
-但是股票已经上涨30%：
-
-降低评分。
-
-如果：
-
-新闻非常重要，
-但对应A股还没有反应：
-
-提高评分。
-
-============================================================
-十、只输出一个事件
-============================================================
-
-如果存在：
 
 {{
-    "signal": "ONE_BIG_EVENT",
-
-    "event": {{
-
-        "title": "",
-
-        "category": "",
-
-        "event_cluster": "",
-
-        "published_time": "",
-
-        "source_news_ids": [],
-
-        "source_urls": [],
-
-        "news_summary": "",
-
-        "what_changed": "",
-
-        "why_now": "",
-
-        "market_consensus": "",
-
-        "expectation_gap": "",
-
-        "expectation_gap_detail": "",
-
-        "market_price_reaction": "",
-
-        "market_mispricing": "",
-
-        "industry_chain_logic": "",
-
-        "direction": "positive|negative|mixed",
-
-        "a_share_idea": {{
-
-            "name": "",
-            "ticker": "",
-            "type": "stock|ETF",
-
-            "logic": "",
-
-            "directness": "DIRECT|INDIRECT|SECOND_ORDER",
-
-            "current_price_reaction": "",
-
-            "valuation_room": ""
-
-        }},
-
-        "us_reference": [],
-
-        "speaker": {{
-
-            "name": null,
-            "role": null,
-            "statement_type": null,
-            "core_view": null
-
-        }},
-
-        "investment_thesis": "",
-
-        "earnings_impact": "",
-
-        "valuation_impact": "",
-
-        "future_1_4_weeks": {{
-
-            "base_case": "",
-            "bull_case": "",
-            "bear_case": ""
-
-        }},
-
-        "key_catalysts": [],
-
-        "key_risks": [],
-
-        "what_to_watch_next": [],
-
-        "final_conclusion": ""
-
-    }},
-
-    "scores": {{
-
-        "novelty": 0,
-        "fundamental_impact": 0,
-        "transmission": 0,
-        "expectation_gap": 0,
-        "market_mispricing": 0,
-        "catalyst_strength": 0,
-        "investment_score": 0
-
-    }}
-
+    "signal": "MULTIPLE_CANDIDATES",
+    "candidates": [
+        {{
+            "title": "",
+            "category": "",
+            "news_summary": "",
+            "what_changed": "",
+            "expectation_gap": "high|medium|low",
+            "expectation_gap_detail": "",
+            "abnormality_score": 0-100,
+            "abnormality_reason": "",
+            "a_share_idea": {{
+                "name": "",
+                "ticker": "",
+                "type": "stock|ETF",
+                "logic": "",
+                "directness": "DIRECT|INDIRECT|SECOND_ORDER"
+            }},
+            "us_reference": [],
+            "industry_chain_logic": "",
+            "investment_thesis": "",
+            "key_risks": [],
+            "catalyst_timeline": ""
+        }}
+    ]
 }}
 
-如果没有真正的预期差：
-
-{{
-    "signal": "NO_CLEAR_EDGE"
-}}
+如果没有任何事件有预期差：
+{{"signal": "NO_CLEAR_EDGE"}}
 
 ============================================================
 硬性要求
 ============================================================
 
-1. 只允许一个事件。
-2. 不允许TOP5。
-3. 不允许多个候选。
-4. 必须有明确A股股票或ETF。
-5. 必须有基本面逻辑。
-6. 必须结合最新股价。
-7. 不允许使用超过24小时的旧新闻。
-8. 同一事件必须去重。
-9. 不允许为了凑股票而强行关联。
-10. 如果新闻非常重要，但没有A股映射，返回NO_CLEAR_EDGE。
-11. 不要编造股票代码。
-12. 不要编造产业链关系。
-13. 只返回JSON。
+1. 最多输出10个事件，按预期差从高到低排序
+2. 只包含有明确A股映射的事件
+3. 如果某事件已经被市场充分定价，排除
+4. 不要只输出“最大”的新闻，要输出“最异常”的新闻
+5. 只返回JSON
 
 ============================================================
 过去24小时新闻
@@ -1033,88 +718,33 @@ def save_one_big_event(result):
 # ============================================================
 # 8. 主函数：run_batch
 # ============================================================
-
 def run_batch(market_text="unknown"):
-    print("[BATCH] ===== GLOBAL MARKET SURPRISE DETECTOR =====")
-
-    init_db()
-
-    now = datetime.now(timezone.utc)
-    print(f"[BATCH] 当前UTC时间：{now.isoformat()}")
-    print("[BATCH] 时间窗口：过去24小时")
-
-    items = get_recent_news(hours=24)
-    print(f"[BATCH] 获取新闻：{len(items)}条")
-
-    if not items:
-        print("[BATCH] 过去24小时没有新闻")
-        return None
-
-    if market_text != "unknown":
-        print("[BATCH] 使用最新市场数据")
-    else:
-        print("[BATCH] 市场数据不可用")
-
-    prompt = make_batch_prompt(items, now.isoformat(), market_text)
-    print(f"[BATCH] Prompt长度：{len(prompt)}字符")
-
-    print("[BATCH] 使用DeepSeek...")
-    try:
-        raw = call_deepseek(prompt)
-    except Exception as e:
-        print(f"[BATCH] DeepSeek调用失败：{e}")
-        return None
-
-    print(f"[BATCH] LLM返回长度：{len(raw)}字符")
+    # ... 前面的代码保持不变 ...
 
     result = extract_json(raw)
-    if not result:
-        print("[BATCH] LLM JSON解析失败")
-        print(raw[:1000])
-        return None
 
     if result.get("signal") == "NO_CLEAR_EDGE":
         print("[BATCH] 今天没有足够大的预期差")
         return None
 
-    if result.get("signal") != "ONE_BIG_EVENT":
-        print("[BATCH] LLM没有返回ONE_BIG_EVENT")
+    if result.get("signal") != "MULTIPLE_CANDIDATES":
+        print("[BATCH] LLM返回格式异常")
         return None
 
-    event = result.get("event")
-    if not isinstance(event, dict):
-        print("[BATCH] event字段无效")
-        return None
+    candidates = result.get("candidates", [])
+    print(f"[BATCH] LLM返回 {len(candidates)} 个候选事件")
 
-    print("[BATCH] LLM返回候选事件：1个")
-    print(f"[BATCH] 事件：{event.get('title', '')}")
+    # 按异常程度排序
+    candidates.sort(key=lambda x: x.get("abnormality_score", 0), reverse=True)
 
-    # 检查A股映射
-    if not has_valid_a_share_mapping(result):
-        print("[BATCH] 第一次分析没有明确A股/ETF映射")
-        result = repair_a_share_mapping(result, market_text)
+    for idx, event in enumerate(candidates):
+        # 每个事件单独保存到数据库
+        # 使用相同的 save_one_big_event 但传入单个事件
+        score = event.get("scores", {}).get("investment_score", 0)
+        print(f"[BATCH] {idx+1}. {event['title'][:50]}... (评分: {score})")
 
-    if not has_valid_a_share_mapping(result):
-        print("[BATCH] 淘汰：没有可靠A股/ETF映射")
-        print("[BATCH] 没有事件通过最终筛选")
-        return None
-
-    event = result["event"]
-    idea = event["a_share_idea"]
-    scores = result.get("scores", {})
-
-    print("[BATCH] ========================================")
-    print("[BATCH] FINAL ONE BIG EVENT")
-    print(f"[BATCH] 标题：{event.get('title', '')}")
-    print(f"[BATCH] A股：{idea.get('name', '')} {idea.get('ticker', '')}")
-    print(f"[BATCH] 投资逻辑：{idea.get('logic', '')}")
-    print(f"[BATCH] Investment Score：{scores.get('investment_score', 0)}")
-    print("[BATCH] ========================================")
-
-    # 保存数据库
-    try:
-        save_one_big_event(result)
-    except Exception as e:
-        print(f"[BATCH] 保存数据库失败：{e}")
+        # 保存每个事件
+        save_single_event(event)
 
     return result
+
