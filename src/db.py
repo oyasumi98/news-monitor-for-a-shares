@@ -4,7 +4,6 @@ import os
 from datetime import datetime, timezone, timedelta
 
 from .config import DB_PATH
-from .db import init_db, insert_batch_events
 
 
 # ============================================================
