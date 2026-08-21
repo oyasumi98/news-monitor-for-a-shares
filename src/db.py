@@ -128,7 +128,6 @@ def insert_score(rss_item_id, score_data):
 
 
 def get_recent_scored(min_score=60, limit=10):
-    """获取最近评分的事件（供邮件发送使用）"""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -136,7 +135,17 @@ def get_recent_scored(min_score=60, limit=10):
     rows = cur.execute("""
         SELECT 
             e.*,
-            r.title, r.url, r.source, r.published, r.summary
+            r.title, r.url, r.source, r.published, r.summary,
+            COALESCE(e.news_summary, '') as news_summary,
+            COALESCE(e.marginal_change, '') as marginal_change,
+            COALESCE(e.industry_chain_logic, '') as industry_chain_logic,
+            COALESCE(e.strong_linked_us_stocks, '[]') as strong_linked_us_stocks,
+            COALESCE(e.strong_linked_a_stocks, '[]') as strong_linked_a_stocks,
+            COALESCE(e.price_anomaly, '{}') as price_anomaly,
+            COALESCE(e.validation_catalyst, '') as validation_catalyst,
+            COALESCE(e.market_crowdedness, 'unknown') as market_crowdedness,
+            COALESCE(e.expectation_gap_detail, '') as expectation_gap_detail,
+            COALESCE(e.confidence, 0) as confidence
         FROM event_scores e
         JOIN rss_items r ON e.rss_item_id = r.id
         WHERE e.event_score >= ?
