@@ -1,9 +1,70 @@
+
 import sqlite3
 import json
 import os
 from datetime import datetime, timezone, timedelta
 
 from .config import DB_PATH
+
+
+# ============================================================
+# 0. 数据库初始化（补充）
+# ============================================================
+
+def init_db():
+    """初始化数据库，创建 rss_items 和 event_scores 表"""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    # rss_items 表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rss_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guid TEXT UNIQUE,
+            published TEXT,
+            source TEXT,
+            title TEXT,
+            url TEXT,
+            summary TEXT,
+            content TEXT,
+            collected_at TEXT
+        )
+    """)
+
+    # event_scores 表（基础版）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS event_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rss_item_id INTEGER,
+            category TEXT,
+            event_type TEXT,
+            novelty REAL,
+            economic_impact REAL,
+            transmission REAL,
+            expectation_gap REAL,
+            market_sensitivity REAL,
+            event_score REAL,
+            direction TEXT,
+            affected_assets TEXT,
+            affected_industries TEXT,
+            rationale TEXT,
+            second_order_effects TEXT,
+            risks TEXT,
+            model TEXT,
+            scored_at TEXT,
+            FOREIGN KEY (rss_item_id) REFERENCES rss_items(id)
+        )
+    """)
+
+    # 索引
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_rss_item ON event_scores(rss_item_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_score ON event_scores(event_score)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_scored_at ON event_scores(scored_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rss_collected_at ON rss_items(collected_at)")
+
+    con.commit()
+    con.close()
+    print("[DB] 数据库初始化完成")
 
 
 # ============================================================
