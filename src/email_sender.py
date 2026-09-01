@@ -7,13 +7,36 @@ from .db import get_recent_scored
 
 
 def send_email():
-    rows = get_recent_scored(MIN_SCORE_TO_EMAIL, MAX_EMAIL_EVENTS)
+    # 获取所有评分事件（不设门槛，取前100条）
+    rows = get_recent_scored(min_score=0, limit=100)
     if not rows:
-        print("[MAIL] no events over threshold")
+        print("[MAIL] 没有评分事件")
         return
 
-    parts = ["<html><body><h2>Global Market Event Radar</h2>"]
-    for i, row in enumerate(rows, 1):
+    # 按评分降序排序
+    rows.sort(key=lambda x: float(x.get("event_score", 0)), reverse=True)
+
+    # ---- 按类别去重，每个类别只保留评分最高的那条 ----
+    category_best = {}
+    for r in rows:
+        cat = r.get("category", "other")
+        if cat not in category_best:
+            category_best[cat] = r
+        else:
+            # 如果当前评分更高，替换
+            if float(r.get("event_score", 0)) > float(category_best[cat].get("event_score", 0)):
+                category_best[cat] = r
+
+    # ---- 从去重结果中取评分最高的20条 ----
+    best_events = sorted(category_best.values(), key=lambda x: float(x.get("event_score", 0)), reverse=True)[:20]
+
+    if not best_events:
+        print("[MAIL] 没有符合条件的事件")
+        return
+
+    parts = ["<html><body><h2>Global Market Event Radar - Top 20 (类别去重)</h2>"]
+    
+    for i, row in enumerate(best_events, 1):
         r = dict(row)
 
         def to_float(val, default=0.0):
@@ -29,119 +52,90 @@ def send_email():
         gap = to_float(r.get("expectation_gap"))
         sens = to_float(r.get("market_sensitivity"))
 
-        # ---- 方向（利好/利空） ----
-        direction = r.get("direction", "unknown")
-        direction_emoji = {"positive": "🟢", "negative": "🔴", "mixed": "🟡", "unknown": "⚪"}.get(direction, "⚪")
-        direction_label = {"positive": "利好", "negative": "利空", "mixed": "混合", "unknown": "未知"}.get(direction, "未知")
-
-        # ============================================================
-        # 关键修复：从 affected_assets JSON 中解析扩展信息
-        # ============================================================
-        affected_raw = r.get("affected_assets", "{}")
+        # ---- 解析 affected_assets 中的扩展信息 ----
+        extra = {}
         try:
-            extra = json.loads(affected_raw) if isinstance(affected_raw, str) else {}
+            affected_raw = r.get("affected_assets", "{}")
+            if isinstance(affected_raw, str):
+                extra = json.loads(affected_raw) if affected_raw else {}
+            else:
+                extra = affected_raw if affected_raw else {}
         except:
-            extra = {}
+            pass
 
-        # ---- A股映射 ----
+        # 提取A股映射
         a_share = extra.get("a_share", {})
-        a_share_name = a_share.get("name", "")
-        a_share_ticker = a_share.get("ticker", "")
-        a_share_logic = a_share.get("logic", "")
-        a_share_directness = a_share.get("directness", "")
+        a_name = a_share.get("name", "")
+        a_ticker = a_share.get("ticker", "")
+        a_logic = a_share.get("logic", "")
+        a_directness = a_share.get("directness", "")
 
-        # ---- 美股参考 ----
-        us_reference = extra.get("us_reference", [])
-
-        # ---- 预期差详细 ----
+        # 提取其他信息
+        us_ref = extra.get("us_reference", [])
         exp_gap_detail = extra.get("expectation_gap_detail", "")
-        exp_gap_label = {"high": "高", "medium": "中", "low": "低"}.get(
-            r.get("expectation_gap", "unknown"), "未知"
-        )
+        catalysts = extra.get("key_catalysts", [])
+        catalyst_text = "\n".join(catalysts) if catalysts else ""
+        industry_chain = extra.get("industry_chain_logic", "") or r.get("industry_chain_logic", "")
 
-        # ---- 催化剂 ----
-        key_catalysts = extra.get("key_catalysts", [])
-        catalysts_text = "\n".join(key_catalysts) if key_catalysts else ""
+        # 方向（从数据库直接取）
+        direction = r.get("direction", "unknown")
+        dir_emoji = {"positive": "🟢", "negative": "🔴", "mixed": "🟡", "unknown": "⚪"}.get(direction, "⚪")
+        dir_label = {"positive": "利好", "negative": "利空", "mixed": "混合", "unknown": "未知"}.get(direction, "未知")
 
-        # ---- 未来情景 ----
-        future = extra.get("future_1_4_weeks", {})
-        base_case = future.get("base_case", "")
-        bull_case = future.get("bull_case", "")
-        bear_case = future.get("bear_case", "")
-
-        # ---- 市场反应 ----
-        market_price_reaction = extra.get("market_price_reaction", "")
-        market_mispricing = extra.get("market_mispricing", "")
+        # 预期差（从 affected_assets 中取）
+        exp_gap = r.get("expectation_gap", "unknown")
+        gap_label = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}.get(exp_gap, "未知")
 
         parts.append(f"""
         <hr>
         <h3>{i}. {r["title"]} - MEI {score:.0f}</h3>
         <p><b>类型：</b>{r["category"]} / {r["event_type"]}</p>
-        <p><b>评分：</b>Novelty {novelty:.0f};
-        Impact {impact:.0f};
-        Transmission {trans:.0f};
-        Expectation Gap {gap:.0f};
-        Sensitivity {sens:.0f}</p>
-        <p><b>{direction_emoji} 方向：</b>{direction_label}</p>
-        <p><b>📌 预期差：</b>{exp_gap_label} | {exp_gap_detail}</p>
-        <p><b>📌 为什么重要：</b>{r["rationale"]}</p>
+        <p><b>评分：</b>Novelty {novelty:.0f}; Impact {impact:.0f}; Transmission {trans:.0f}; Expectation Gap {gap:.0f}; Sensitivity {sens:.0f}</p>
+        <p><b>{dir_emoji} 方向：</b>{dir_label}</p>
+        <p><b>📌 预期差：</b>{gap_label} | {exp_gap_detail}</p>
+        <p><b>📌 发生了什么：</b>{r.get("news_summary", "") or r.get("rationale", "")}</p>
         """)
 
-        # ---- A股映射（从 affected_assets 解析） ----
-        if a_share_name and a_share_ticker:
+        # A股映射（必须有）
+        if a_name and a_ticker:
             parts.append(f"""
             <p><b>🇨🇳 核心A股标的：</b>
-            <br><b>{a_share_ticker}</b> {a_share_name} 
-            <br>关联度：{a_share_directness}
-            <br>逻辑：{a_share_logic}</p>
+            <br><b>{a_ticker}</b> {a_name} 
+            <br>关联度：{a_directness}
+            <br>逻辑：{a_logic}</p>
             """)
+        else:
+            # 如果 affected_assets 里没有，尝试从 strong_linked_a_stocks 取（兼容旧数据）
+            try:
+                a_stocks = json.loads(r.get("strong_linked_a_stocks", "[]")) if isinstance(r.get("strong_linked_a_stocks"), str) else []
+                if a_stocks:
+                    a = a_stocks[0]
+                    parts.append(f"""
+                    <p><b>🇨🇳 A股映射：</b>
+                    <br><b>{a.get('ticker', '')}</b> {a.get('name', '')}
+                    <br>逻辑：{a.get('logic', '')}</p>
+                    """)
+            except:
+                pass
 
-        # ---- 美股参考 ----
-        if us_reference:
-            us_lines = []
-            for ref in us_reference:
-                if isinstance(ref, dict):
-                    ticker = ref.get("ticker", "")
-                    company = ref.get("company", "")
-                    logic = ref.get("logic", "")
-                    us_lines.append(f"<b>{ticker}</b> ({company}): {logic}")
-                else:
-                    us_lines.append(str(ref))
-            parts.append(f"<p><b>🇺🇸 美股参考：</b><br>{'<br>'.join(us_lines)}</p>")
+        # 产业链逻辑
+        if industry_chain:
+            parts.append(f"<p><b>🔗 产业链逻辑：</b>{industry_chain}</p>")
 
-        # ---- 产业链逻辑 ----
-        if r.get("industry_chain_logic"):
-            parts.append(f"<p><b>🔗 产业链逻辑：</b>{r.get('industry_chain_logic')}</p>")
+        # 催化剂
+        if catalyst_text:
+            parts.append(f"<p><b>⏰ 催化剂：</b><br>{catalyst_text}</p>")
 
-        # ---- 市场反应 ----
-        if market_price_reaction:
-            parts.append(f"<p><b>📊 市场反应：</b>{market_price_reaction}</p>")
-        if market_mispricing:
-            parts.append(f"<p><b>🎯 市场错误定价：</b>{market_mispricing}</p>")
+        # 风险
+        if r.get("risks"):
+            parts.append(f"<p><b>⚠️ 风险：</b>{r['risks']}</p>")
 
-        # ---- 未来情景 ----
-        if any([base_case, bull_case, bear_case]):
-            parts.append(f"""
-            <p><b>🔮 未来1-4周情景：</b>
-            <br><b>基准：</b>{base_case}
-            <br><b>乐观：</b>{bull_case}
-            <br><b>悲观：</b>{bear_case}</p>
-            """)
-
-        # ---- 催化剂 ----
-        if catalysts_text:
-            parts.append(f"<p><b>⏰ 关键催化剂：</b><br>{catalysts_text}</p>")
-
-        # ---- 风险 ----
-        parts.append(f"""
-        <p><b>⚠️ 风险：</b>{r["risks"]}</p>
-        <p><a href="{r["url"]}">查看原文</a></p>
-        """)
+        parts.append(f'<p><a href="{r["url"]}">查看原文</a></p>')
 
     parts.append("</body></html>")
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Global Market Event Radar | {len(rows)} events"
+    msg["Subject"] = f"Global Market Event Radar | 精选 {len(best_events)} 个事件"
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
     msg.attach(MIMEText("\n".join(parts), "html", "utf-8"))
@@ -149,7 +143,7 @@ def send_email():
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
-    print(f"[MAIL] sent {len(rows)} events")
+    print(f"[MAIL] 发送 {len(best_events)} 个事件")
 
 
 if __name__ == "__main__":
