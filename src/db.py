@@ -320,17 +320,24 @@ def extract_json(text):
 
 def make_batch_prompt(items, current_time, market_text):
     news_blocks = []
-    for i, item in enumerate(items[:150]):  # 限制前150条，避免超长
+    for i, item in enumerate(items[:150]):
+        # ---- 关键修复：安全处理新闻内容中的 { 和 } ----
+        def safe_str(s):
+            if s is None:
+                return ""
+            # 替换 { 和 } 为不可见字符，防止 f-string 解析错误
+            return str(s).replace("{", "【").replace("}", "】")
+        
         news_blocks.append(f"""
 ================ NEWS {i} ================
 
-NEWS_ID: {item.get("id", "")}
-SOURCE: {item.get("source", "")}
-PUBLISHED: {item.get("published", "")}
-TITLE: {item.get("title", "")}
-SUMMARY: {item.get("summary", "")}
-CONTENT: {item.get("content", "")[:2000]}
-URL: {item.get("url", "")}
+NEWS_ID: {safe_str(item.get("id", ""))}
+SOURCE: {safe_str(item.get("source", ""))}
+PUBLISHED: {safe_str(item.get("published", ""))}
+TITLE: {safe_str(item.get("title", ""))}
+SUMMARY: {safe_str(item.get("summary", ""))}
+CONTENT: {safe_str(item.get("content", ""))[:2000]}
+URL: {safe_str(item.get("url", ""))}
 
 ===========================================
 """)
@@ -347,7 +354,7 @@ URL: {item.get("url", "")}
 
 从过去24小时新闻中，识别出所有具有潜在预期差的事件。
 
-**你必须输出至少5个、最多10个候选事件。**
+**你必须输出至少5个、最多20个候选事件。**
 
 不要只选1个。如果有多个事件有预期差，全部列出。
 
@@ -392,8 +399,7 @@ URL: {item.get("url", "")}
             "investment_thesis": "投资要点",
             "key_risks": ["风险1", "风险2"],
             "catalyst_timeline": "未来催化剂时间"
-        }},
-        ...
+        }}
     ]
 }}
 
@@ -417,6 +423,7 @@ URL: {item.get("url", "")}
 
 {news_text}
 """
+
 
 
 # ============================================================
