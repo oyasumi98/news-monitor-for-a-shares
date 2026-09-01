@@ -1,4 +1,3 @@
-```python
 import smtplib
 import json
 import html
