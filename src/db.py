@@ -233,9 +233,19 @@ def call_deepseek(prompt):
 
 
 def extract_json(text):
+    """
+    从 LLM 返回的文本中提取 JSON。
+    支持：代码块包裹、文本中嵌入 JSON、多个 JSON 对象。
+    """
     if not text:
         return None
+
     text = text.strip()
+    print(f"[DEBUG] extract_json 输入长度: {len(text)} 字符")
+    print(f"[DEBUG] 前 500 字符: {text[:500]}...")
+    print(f"[DEBUG] 后 500 字符: {text[-500:]}...")
+
+    # 1. 移除 markdown 代码块
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3:
@@ -243,17 +253,64 @@ def extract_json(text):
             if lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
+        print(f"[DEBUG] 移除代码块后长度: {len(text)}")
+
+    # 2. 尝试直接解析
     try:
-        return json.loads(text)
-    except Exception:
-        pass
+        result = json.loads(text)
+        print("[DEBUG] 直接解析成功")
+        return result
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] 直接解析失败: {e}")
+
+    # 3. 尝试从第一个 { 到最后一个 } 提取
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
+        candidate = text[start:end + 1]
+        print(f"[DEBUG] 提取候选 JSON，长度: {len(candidate)}")
         try:
-            return json.loads(text[start:end+1])
-        except Exception:
-            pass
+            result = json.loads(candidate)
+            print("[DEBUG] 候选 JSON 解析成功")
+            return result
+        except json.JSONDecodeError as e:
+            print(f"[DEBUG] 候选 JSON 解析失败: {e}")
+            # 打印候选内容的前 300 字符帮助调试
+            print(f"[DEBUG] 候选内容前 300 字符: {candidate[:300]}...")
+
+    # 4. 尝试逐个解析 JSON 对象（如果返回了多个）
+    # 使用正则找到所有 JSON 对象
+    import re
+    json_pattern = r'\{[^{}]*\}'
+    matches = re.findall(json_pattern, text)
+    if matches:
+        print(f"[DEBUG] 正则匹配到 {len(matches)} 个 JSON 片段")
+        for i, match in enumerate(matches):
+            try:
+                result = json.loads(match)
+                print(f"[DEBUG] 第 {i+1} 个 JSON 片段解析成功")
+                return result
+            except json.JSONDecodeError:
+                continue
+
+    # 5. 如果上述都失败，尝试修复常见的 JSON 问题
+    # 例如：去除尾随逗号、单引号替换为双引号等
+    try:
+        import re
+        # 去除尾随逗号（在 } 或 ] 之前）
+        fixed = re.sub(r',\s*([}\]])', r'\1', text)
+        # 尝试提取并解析
+        start = fixed.find("{")
+        end = fixed.rfind("}")
+        if start >= 0 and end > start:
+            candidate = fixed[start:end + 1]
+            result = json.loads(candidate)
+            print("[DEBUG] 修复后解析成功")
+            return result
+    except Exception as e:
+        print(f"[DEBUG] 修复后解析仍失败: {e}")
+
+    print("[DEBUG] 所有解析方法均失败")
     return None
 
 
@@ -347,7 +404,7 @@ URL: {item.get("url", "")}
 硬性要求
 ============================================================
 
-1. **必须输出至少5个事件**，最多10个
+1. **必须输出至少5个事件**，最多20个
 2. 按预期差从高到低排序
 3. 优先选择有A股映射的事件，但**不要因为A股映射不明确就完全排除**
 4. 如果某事件已经被市场充分定价，排除
