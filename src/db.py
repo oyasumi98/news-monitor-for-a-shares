@@ -122,7 +122,11 @@ def insert_score(rss_item_id, score_data):
     con.close()
 
 
-def get_recent_scored(min_score=60, limit=10):
+def get_recent_scored(min_score=0, limit=100):
+    """
+    获取评分事件，默认不设门槛（min_score=0）
+    返回所有有评分的记录，按评分降序排列
+    """
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -277,7 +281,6 @@ URL: {item.get("url", "")}
 """)
     news_text = "\n".join(news_blocks)
 
-    # 使用多行字符串，注意内部不再包含三重引号，所有 JSON 示例使用单行或转义
     return f"""
 你是一名全球宏观、科技产业、政策和事件驱动投资领域的资深策略分析师。
 
@@ -366,11 +369,11 @@ def save_single_event(event, rss_item_id):
         "category": event.get("category", "other"),
         "event_type": event.get("title", "")[:100],
         "novelty": event.get("abnormality_score", 0),
-        "economic_impact": 50,  # 由LLM未明确给出，给个中性值
+        "economic_impact": 50,
         "transmission": 50,
         "expectation_gap": 50,
         "market_sensitivity": 50,
-        "event_score": event.get("abnormality_score", 0),  # 直接用异常分作为总分
+        "event_score": event.get("abnormality_score", 0),
         "direction": "unknown",
         "affected_assets": json.dumps({
             "a_share": event.get("a_share_idea", {}),
@@ -389,6 +392,35 @@ def save_single_event(event, rss_item_id):
     }
     insert_score(rss_item_id, score_data)
     print(f"[BATCH] 保存事件：{event.get('title', '')[:50]} (评分：{event.get('abnormality_score', 0)})")
+
+
+def find_news_id_for_event(event, items):
+    """
+    尝试为事件匹配对应的新闻ID
+    优先通过标题关键词匹配，否则返回第一条新闻的ID
+    """
+    # 方法1：通过新闻摘要关键词匹配
+    title_keywords = event.get("title", "")[:30].strip()
+    if title_keywords and len(title_keywords) > 5:
+        for item in items:
+            item_title = item.get("title", "")
+            # 检查关键词是否在新闻标题中
+            if title_keywords.lower() in item_title.lower():
+                return item.get("id")
+    
+    # 方法2：通过事件聚类名称匹配
+    cluster = event.get("category", "")
+    if cluster and len(cluster) > 3:
+        for item in items:
+            item_title = item.get("title", "")
+            if cluster.lower() in item_title.lower():
+                return item.get("id")
+    
+    # 方法3：返回第一条新闻的ID（兜底）
+    if items:
+        return items[0].get("id")
+    
+    return None
 
 
 # ============================================================
@@ -433,7 +465,7 @@ def run_batch(market_text="unknown"):
         return None
 
     if result.get("signal") != "MULTIPLE_CANDIDATES":
-        print("[BATCH] 信号格式异常，预期 MULTIPLE_CANDIDATES")
+        print(f"[BATCH] 信号格式异常，预期 MULTIPLE_CANDIDATES，实际: {result.get('signal')}")
         return None
 
     candidates = result.get("candidates", [])
@@ -442,23 +474,30 @@ def run_batch(market_text="unknown"):
         return None
 
     print(f"[BATCH] 共识别出 {len(candidates)} 个候选事件")
-    # 按异常分排序
     candidates.sort(key=lambda x: x.get("abnormality_score", 0), reverse=True)
 
     # 保存每个事件
+    saved_count = 0
     for idx, evt in enumerate(candidates):
-        # 从原始新闻列表中匹配一个 news_id（取第一个来源）
-        # 简单起见，我们只取第一个新闻的ID
-        # 在真实场景中，可以匹配更精准，这里简化
-        rss_item_id = None
-        if items:
-            # 取第一条新闻ID（或按标题匹配，这里取第一条）
-            rss_item_id = items[0].get("id")
+        # 尝试匹配对应的新闻ID
+        rss_item_id = find_news_id_for_event(evt, items)
         if rss_item_id is None:
             print(f"[BATCH] 跳过保存，无关联新闻ID：{evt.get('title', '')[:30]}")
             continue
         save_single_event(evt, rss_item_id)
+        saved_count += 1
         print(f"[BATCH] {idx+1}. {evt.get('title', '')[:60]} - 异常分：{evt.get('abnormality_score', 0)}")
 
-    print("[BATCH] 所有事件已保存")
+    print(f"[BATCH] 成功保存 {saved_count}/{len(candidates)} 个事件")
+
+    # ---- 验证：查询 event_scores 表记录数 ----
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        count = cur.execute("SELECT COUNT(*) FROM event_scores").fetchone()[0]
+        print(f"[BATCH] 验证：event_scores 表中当前共有 {count} 条记录")
+        con.close()
+    except Exception as e:
+        print(f"[BATCH] 验证查询失败：{e}")
+
     return result
