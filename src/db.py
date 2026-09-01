@@ -587,9 +587,12 @@ def run_batch(market_text="unknown"):
     print(f"[BATCH] LLM返回长度：{len(raw)}字符")
     result = extract_json(raw)
     if not result:
-        print("[BATCH] JSON解析失败")
-        return None
-
+    print("[BATCH] JSON解析失败，尝试从返回中提取候选...")
+    # 可以尝试另一种解析方式，比如正则提取多个 JSON 对象
+    # 但最简单的是直接返回 None，并打印提示
+    print("[BATCH] 建议检查 debug_raw.txt 查看原始返回")
+    return None
+    
     if result.get("signal") == "NO_CLEAR_EDGE":
         print("[BATCH] 没有识别到有预期差的事件")
         return None
