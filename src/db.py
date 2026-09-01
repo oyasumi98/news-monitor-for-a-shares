@@ -488,7 +488,47 @@ def save_one_big_event(result):
 # ============================================================
 # 主函数
 # ============================================================
+# ============================================================
+# 获取过去24小时新闻
+# ============================================================
 
+def get_recent_news(hours=24, limit=None):
+    """
+    从 rss_items 表中获取过去 hours 小时内的新闻
+    
+    Args:
+        hours: 时间范围（小时），默认24
+        limit: 最大返回条数，默认 None 表示不限制
+    
+    Returns:
+        list: 新闻列表，每个元素为 dict
+    """
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    
+    # 计算时间阈值
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff_str = cutoff.isoformat()
+    
+    # 构建查询
+    query = """
+        SELECT id, guid, published, source, title, url, summary, content, collected_at
+        FROM rss_items
+        WHERE collected_at >= ?
+        ORDER BY collected_at DESC
+    """
+    params = [cutoff_str]
+    
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    
+    rows = cur.execute(query, params).fetchall()
+    con.close()
+    
+    return [dict(row) for row in rows]
+    
 def run_batch(market_text="unknown"):
     print("[BATCH] ===== GLOBAL MARKET SURPRISE DETECTOR =====")
     init_db()
