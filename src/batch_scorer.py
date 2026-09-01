@@ -2,9 +2,15 @@
 
 import json
 import os
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timezone, timedelta
 
-from .db import get_recent_news
+from .db import (
+    init_db,
+    get_recent_news,
+    insert_score,
+)
+from .config import DB_PATH
 
 
 # ============================================================
@@ -21,7 +27,10 @@ def get_deepseek_client():
 
     return OpenAI(
         api_key=api_key,
-        base_url="https://api.deepseek.com"
+        base_url=os.getenv(
+            "DEEPSEEK_BASE_URL",
+            "https://api.deepseek.com"
+        )
     )
 
 
@@ -35,11 +44,18 @@ def call_deepseek(prompt):
         ),
         messages=[
             {
+                "role": "system",
+                "content": (
+                    "你是全球宏观、科技产业、政策和事件驱动投资领域的资深A股策略分析师。"
+                    "你的输出必须严格遵守用户要求，只输出合法JSON。"
+                )
+            },
+            {
                 "role": "user",
                 "content": prompt
             }
         ],
-        temperature=0.15,
+        temperature=0.1,
         max_tokens=12000
     )
 
@@ -51,28 +67,42 @@ def call_deepseek(prompt):
 # ============================================================
 
 def extract_json(text):
+    """
+    尽可能稳健地从LLM返回中提取JSON。
+    """
 
     if not text:
         return None
 
-    text = text.strip()
+    text = str(text).strip()
 
-    if text.startswith("```"):
-        lines = text.splitlines()
-
-        if len(lines) >= 3:
-            lines = lines[1:]
-
-            if lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-
-            text = "\n".join(lines).strip()
+    # --------------------------------------------------------
+    # 1. 直接解析
+    # --------------------------------------------------------
 
     try:
         return json.loads(text)
-
     except Exception:
         pass
+
+    # --------------------------------------------------------
+    # 2. 去掉 markdown code block
+    # --------------------------------------------------------
+
+    if "```json" in text:
+        text = text.replace("```json", "").replace("```", "").strip()
+
+    elif "```" in text:
+        text = text.replace("```", "").strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # 3. 从第一个 { 到最后一个 }
+    # --------------------------------------------------------
 
     start = text.find("{")
     end = text.rfind("}")
@@ -83,15 +113,121 @@ def extract_json(text):
 
         try:
             return json.loads(candidate)
-
         except Exception:
             pass
+
+    # --------------------------------------------------------
+    # 4. 从第一个 [ 到最后一个 ]
+    # --------------------------------------------------------
+
+    start = text.find("[")
+    end = text.rfind("]")
+
+    if start >= 0 and end > start:
+
+        candidate = text[start:end + 1]
+
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # 5. 修复尾随逗号
+    # --------------------------------------------------------
+
+    try:
+        import re
+
+        fixed = re.sub(
+            r",\s*([}\]])",
+            r"\1",
+            text
+        )
+
+        start = fixed.find("{")
+        end = fixed.rfind("}")
+
+        if start >= 0 and end > start:
+            return json.loads(
+                fixed[start:end + 1]
+            )
+
+    except Exception:
+        pass
+
+    print("[BATCH] JSON解析失败")
+    print(
+        "[BATCH] LLM原始返回前1000字符："
+        + text[:1000]
+    )
 
     return None
 
 
 # ============================================================
-# 新闻Prompt
+# 新闻文本
+# ============================================================
+
+def build_news_text(items):
+
+    blocks = []
+
+    for i, item in enumerate(items):
+
+        news_id = item.get("id", "")
+
+        source = item.get(
+            "source",
+            "unknown"
+        )
+
+        published = item.get(
+            "published"
+            or "collected_at",
+            "unknown"
+        )
+
+        title = item.get(
+            "title",
+            ""
+        )
+
+        summary = item.get(
+            "summary",
+            ""
+        )
+
+        content = item.get(
+            "content",
+            ""
+        )
+
+        url = item.get(
+            "url",
+            ""
+        )
+
+        # 防止prompt无限膨胀
+        content = str(content)[:1200]
+
+        blocks.append(
+            f"""
+NEWS_ID: {news_id}
+SOURCE: {source}
+PUBLISHED: {published}
+TITLE: {title}
+SUMMARY: {summary}
+CONTENT: {content}
+URL: {url}
+"""
+        )
+
+    return "\n".join(blocks)
+
+
+# ============================================================
+# 核心Prompt
 # ============================================================
 
 def make_batch_prompt(
@@ -100,388 +236,334 @@ def make_batch_prompt(
     market_text
 ):
 
-    news_blocks = []
-
-    for i, item in enumerate(items):
-
-        news_id = item.get(
-            "id",
-            i
-        )
-
-        source = (
-            item.get("source")
-            or item.get("feed")
-            or "unknown"
-        )
-
-        published = (
-            item.get("published")
-            or item.get("published_at")
-            or item.get("collected_at")
-            or "unknown"
-        )
-
-        title = item.get(
-            "title",
-            ""
-        )
-
-        summary = (
-            item.get("summary")
-            or item.get("description")
-            or ""
-        )
-
-        url = (
-            item.get("url")
-            or item.get("link")
-            or ""
-        )
-
-        news_blocks.append(
-            f"""
-================ NEWS {i} ================
-
-NEWS_ID:
-{news_id}
-
-SOURCE:
-{source}
-
-PUBLISHED:
-{published}
-
-TITLE:
-{title}
-
-SUMMARY:
-{summary}
-
-URL:
-{url}
-
-==========================================
-"""
-        )
-
-    news_text = "\n".join(
-        news_blocks
-    )
+    news_text = build_news_text(items)
 
     return f"""
+你是一名拥有15年以上经验的全球宏观、科技产业和A股事件驱动策略分析师。
 
-你是一名拥有10年以上经验的全球宏观、科技产业、
-商品、政策和A股事件驱动策略分析师。
-
-你的任务不是寻找“最热门新闻”。
-
-你的任务是：
-
-从过去24小时全球新闻中，
-寻找20个彼此独立、具有明确A股交易映射、
-并且未来1～4周可能产生市场影响的重大事件。
-
-============================================================
-当前时间
-============================================================
-
+当前时间：
 {current_time}
 
 ============================================================
-核心目标
+核心任务
 ============================================================
 
-最终输出：
+从过去24小时发生的新闻中，寻找：
 
-TOP 20 GLOBAL MARKET EVENTS
+【20个最值得A股投资者关注的重大边际变化事件】
 
-必须满足：
+最终必须输出20条。
 
-1. 每个事件必须是过去24小时出现的新信息。
+不是简单寻找20条热门新闻。
 
-2. 同一个事件的不同媒体报道必须合并。
+真正要寻找的是：
 
-3. 标题不同但本质相同，必须视为同一个事件。
-
-4. 不允许为了凑20条，把同一个事件拆成多个事件。
-
-5. 每个事件必须存在明确的A股上市公司或者A股ETF映射。
-
-6. 不允许纯概念映射。
-
-7. 优先选择DIRECT关系。
-
-8. 如果不存在DIRECT，可以使用INDIRECT。
-
-9. 如果只有ETF能够准确表达，则可以使用ETF。
-
-10. 禁止为了凑数量而编造股票。
+新信息
++
+预期差
++
+基本面影响
++
+产业链传导
++
+明确A股映射
++
+未来可能继续演绎
 
 ============================================================
 一、时间限制
 ============================================================
 
-严格限制：
+严格限制在过去24小时。
 
-过去24小时。
+核心事件必须发生在过去24小时。
 
-如果只是：
+旧新闻再次报道：
 
-旧新闻重新报道
-旧观点重复传播
-旧政策再次解读
-旧数据再次分析
+淘汰。
 
-必须淘汰。
+如果新闻只是对过去事件的重复报道：
 
-重点寻找：
+淘汰。
 
-新数据
-新订单
-新产能
-新融资
-新资本开支
-新技术
-新产品
-新政策
-新监管
-新价格
-新供需变化
-新事故
-新制裁
-新并购
-新IPO
-新财报
-重要人物最新表态
-产业链最新变化
-
-============================================================
-二、新闻去重
-============================================================
-
-这是最重要的要求之一。
-
-你必须进行“事件级去重”。
-
-例如：
-
-新闻A：
-美国30年国债收益率创多年新高
-
-新闻B：
-全球长期融资成本创新高
-
-新闻C：
-美国财政赤字推动长期利率上升
-
-如果三者核心驱动因素相同：
-
-必须合并成：
-
-“美国长期国债收益率持续上行”
-
-不能输出3条。
-
-同样：
-
-新闻A：
-Unitree上市大涨
-
-新闻B：
-中国人形机器人公司上市
-
-新闻C：
-机器人IPO受到市场追捧
-
-如果本质上都是同一个事件：
+如果新闻标题不同，但实际上描述的是同一件事情：
 
 必须合并。
 
+例如：
+
+“30年美债收益率创高位”
+
+“全球长期融资成本上升”
+
+“美国财政赤字担忧”
+
+如果本质由同一个驱动因素造成：
+
+只能算一个事件。
+
 ============================================================
-三、事件必须“真正不同”
+二、事件级去重
 ============================================================
 
-20个事件必须尽可能分散。
+特别注意：
 
-不要出现：
+不要按照新闻标题去重。
 
-10条美债新闻
-8条AI新闻
-6条油价新闻
+必须按照：
 
-应该尽可能覆盖：
+【核心事实 + 核心驱动因素 + 核心经济影响】
+
+判断是不是同一个事件。
+
+例如：
+
+A媒体：
+美国财政部扩大长期国债回购。
+
+B媒体：
+美国30年期美债收益率下降。
+
+C媒体：
+黄金上涨。
+
+如果三者本质都是因为：
+
+美国财政部扩大长期国债回购
+
+那么只能保留一个核心事件。
+
+但：
+
+美国财政部扩大回购
+
+和
+
+美联储官员突然改变降息表态
+
+属于两个不同事件。
+
+============================================================
+三、20条事件必须有差异
+============================================================
+
+最终20条不能全部来自同一个主题。
+
+尽量覆盖：
 
 宏观
 政策
 科技
 AI
 半导体
+机器人
+新能源
 能源
 化工
-有色
 农业
+有色金属
 医药
-机器人
 消费
-汽车
-航运
 金融
-地产
+航运
 军工
-地缘政治
-商品
+地产
+制造业
 产业链
+重要人物观点
 
-但不是机械要求平均分配。
+但不是为了凑类别。
 
-如果某一天科技事件明显更多，可以增加科技事件。
+如果某个行业没有真正有价值的事件：
 
-============================================================
-四、特别关注产业链
-============================================================
-
-科技产业链是重点。
-
-尤其关注：
-
-AI
-GPU
-HBM
-先进封装
-服务器
-光模块
-PCB
-液冷
-数据中心
-电力设备
-半导体设备
-半导体材料
-机器人
-自动驾驶
-智能汽车
-人形机器人
-工业软件
-通信
-卫星
-能源科技
-
-必须尽量向产业链下游继续推演。
-
-例如：
-
-AI资本开支增加
-
-↓
-
-GPU需求
-
-↓
-
-HBM需求
-
-↓
-
-先进封装
-
-↓
-
-光模块
-
-↓
-
-PCB
-
-↓
-
-液冷
-
-↓
-
-电力设备
-
-最终判断：
-
-哪个环节的盈利预期最可能发生变化。
+可以不选。
 
 ============================================================
-五、政策事件
+四、政策新闻限制
 ============================================================
 
-政策新闻重要，但不能占据全部结果。
+政策类事件：
 
-正常情况下：
+原则上最多3条。
 
-政策类事件最多4条。
+除非过去24小时出现真正不同且重大的一组政策变化。
 
-如果出现重大政策密集发布，可以适当增加。
+不要把：
+
+央行政策
+财政政策
+产业政策
+监管政策
+
+写成大量相似新闻。
+
+============================================================
+五、重点寻找“预期差”
+============================================================
+
+每条事件必须回答：
+
+市场原来认为：
+
+什么？
+
+现在突然发生了：
+
+什么？
+
+因此市场可能需要：
+
+重新定价什么？
+
+重点寻找：
+
+1. 新闻重大，但A股相关股票没有明显上涨；
+
+2. 新闻没有特别热门，但可能改变未来盈利；
+
+3. 产业链上游出现供给变化；
+
+4. 下游需求突然变化；
+
+5. 大客户资本开支变化；
+
+6. 新订单；
+
+7. 新产能；
+
+8. 产品价格变化；
+
+9. 库存变化；
+
+10. 技术突破；
+
+11. 重要公司CEO突然改变表态；
+
+12. 重要投资人/产业人物发表与基本面有关的重要观点；
+
+13. 海外公司变化可能传导到中国产业链；
+
+14. 一个冷门事件可能成为未来1个月的主线。
+
+============================================================
+六、重要人物观点
+============================================================
+
+必须关注：
+
+CEO
+CFO
+产业专家
+科学家
+经济学家
+央行官员
+政府官员
+基金经理
+知名投资人
+产业链核心人物
 
 但是：
 
-同一个政策主题必须合并。
+普通评论不要。
+
+必须是：
+
+能够改变市场对行业基本面判断的观点。
+
+区分：
+
+FACT
+事实
+
+GUIDANCE
+指引/预测
+
+OPINION
+观点
+
+============================================================
+七、科技产业链
+============================================================
+
+科技事件必须尽量深入产业链。
 
 例如：
 
-央行降息
-央行释放宽松信号
-市场提高降息预期
+AI资本开支
 
-如果本质属于同一政策变化：
+↓
 
-合并。
+GPU
 
-============================================================
-六、重要人物发言
-============================================================
+↓
 
-特别关注：
+HBM
 
-企业CEO
-科技公司创始人
-央行官员
-财政部长
-重要政府官员
-行业协会负责人
-知名投资人
-重要分析师
-产业链核心企业负责人
+↓
 
-但必须区分：
+先进封装
 
-FACT
-GUIDANCE
-OPINION
+↓
 
-尤其关注：
+光模块
 
-与产业链
-资本开支
-订单
-需求
-产能
-产品
-技术路线
-价格
+↓
 
-直接相关的发言。
+PCB
 
-纯政治评论、情绪表达、没有基本面意义的观点：
+↓
 
-淘汰。
+服务器
+
+↓
+
+电力
+
+↓
+
+数据中心
+
+不能只写：
+
+“AI利好科技股”。
+
+必须找到：
+
+哪个具体环节的订单、价格、产能、收入或者利润可能变化。
 
 ============================================================
-七、A股映射
+八、A股映射
 ============================================================
 
 这是硬性条件。
 
-每个事件必须至少找到：
+20条最终事件：
 
-一个A股上市公司
+【必须全部有明确A股股票或者A股ETF】
+
+不能：
+
+纯概念。
+
+不能：
+
+“AI相关股票”。
+
+不能：
+
+“机器人板块”。
+
+必须给：
+
+公司名称
++
+6位股票代码
 
 或者：
 
-一个A股ETF。
+ETF名称
++
+ETF代码
 
 优先级：
 
@@ -491,14 +573,19 @@ INDIRECT
 >
 SECOND_ORDER
 
-禁止：
+如果一个事件完全找不到真实A股映射：
 
-纯概念
-蹭热点
-业务关系非常弱
-仅仅因为名字相似
+不要输出。
 
-必须说明：
+但是：
+
+不要为了有股票而强行找概念股。
+
+============================================================
+九、A股标的必须解释
+============================================================
+
+必须解释：
 
 事件
 
@@ -512,226 +599,188 @@ SECOND_ORDER
 
 ↓
 
-估值变化
+估值
 
 ↓
 
-股价可能变化
+股价
+
+至少形成完整逻辑。
+
+例如：
+
+美国数据中心资本开支增加
+
+↓
+
+光模块需求增加
+
+↓
+
+800G/1.6T需求增长
+
+↓
+
+中际旭创海外客户订单增长
+
+↓
+
+收入和利润预期上修
+
+↓
+
+估值可能重新定价
+
+这种才算有效映射。
 
 ============================================================
-八、A股标的选择原则
+十、结合最新行情
 ============================================================
 
-优先：
-
-1. 业务直接受影响的公司
-
-2. 核心供应商
-
-3. 核心客户
-
-4. 行业龙头
-
-5. 盈利弹性大的公司
-
-6. 市场关注度高但尚未充分交易的公司
-
-如果个股无法准确映射：
-
-可以使用ETF。
-
-ETF必须能够准确代表这个事件。
-
-============================================================
-九、最新行情
-============================================================
-
-下面是最新市场数据：
+必须使用以下最新市场数据：
 
 {market_text}
 
-必须使用最新行情。
-
 重点判断：
 
-1. A股标的最近涨跌幅
+1. A股标的最近涨跌幅；
 
-2. 是否已经连续上涨
+2. 是否连续上涨；
 
-3. 是否已经大幅上涨
+3. 是否已经大幅上涨；
 
-4. 是否明显拥挤
+4. 是否已经成为市场热点；
 
-5. 新闻是否已经被股价交易
+5. 是否已经明显拥挤；
 
-6. 新闻重大程度和股价反应是否匹配
+6. 新闻发生后股票是否没有反应；
 
-尤其寻找：
+7. 新闻基本面影响是否明显大于股价反应。
 
-“基本面变化很大，但A股相关股票没有明显上涨”
+尤其关注：
 
-这类事件通常具有更高预期差。
+【基本面变化 > 股价变化】
 
-============================================================
-十、预期差
-============================================================
+这种事件。
 
-不要简单把“重大新闻”当成“高分新闻”。
+它往往比：
 
-重点寻找：
+新闻很好 + 股票已经暴涨
 
-市场原有预期
-
-VS
-
-最新事实
-
-之间的差异。
-
-例如：
-
-市场认为：
-AI资本开支开始放缓
-
-最新事实：
-核心企业继续大幅增加资本开支
-
-这种：
-
-基本面变化 > 市场预期
-
-属于高预期差。
-
-反过来：
-
-市场已经暴涨
-
-但新闻只是符合预期
-
-属于低预期差。
+更有投资价值。
 
 ============================================================
-十一、未来1～4周
+十一、股票表现不能张冠李戴
 ============================================================
 
-每个事件必须寻找：
+绝对禁止：
 
-未来1～4周可能验证逻辑的催化剂。
+把WMT的跌幅解释成美债事件。
 
-例如：
+把MU上涨解释成机器人事件。
 
-财报
-订单
-价格
-库存
-产量
-政策
-会议
-产品发布
-技术验证
-资本开支
-产能投产
-出口数据
-产业数据
+把XOM上涨解释成农业事件。
 
-如果没有明确催化剂：
+每个股票表现：
 
-降低评分。
+必须对应这个股票自己的真实行情。
+
+如果市场数据中没有该股票：
+
+写：
+
+unknown
+
+不能编造。
 
 ============================================================
-十二、评分体系
+十二、最终排序
 ============================================================
 
-每个事件评分：
+按照：
 
-novelty：
-信息新颖度
-
-economic_impact：
-经济/行业/盈利影响
-
-transmission：
-产业链传导能力
-
-expectation_gap：
 预期差
-
-market_mispricing：
-基本面变化与股价反应之间的错配
-
-a_share_mapping：
++
+基本面影响
++
+产业链传导
++
 A股映射强度
++
+未来催化剂
 
-catalyst_strength：
-未来催化强度
+综合排序。
 
-最终：
+不是按照：
 
-investment_score
+新闻热度。
 
-不是单纯选择最热门事件。
+不是按照：
 
-============================================================
-十三、最终排序
-============================================================
+媒体报道数量。
 
-先找到：
+不是按照：
 
-30～50个候选事件。
-
-然后：
-
-去重
-→
-A股映射验证
-→
-行情验证
-→
-预期差评分
-→
-产业链分析
-→
-未来催化分析
-
-最终选择TOP 20。
+股票当前涨幅。
 
 ============================================================
-十四、重要约束
+十三、必须输出20条
 ============================================================
 
-必须输出20个事件。
+最终必须：
 
-但是：
+20条。
 
-如果某事件无法找到可靠A股/ETF：
+不能1条。
 
-不要编造。
+不能5条。
 
-如果真正符合条件的事件不足20个：
+不能10条。
 
-可以输出少于20个。
+不能因为某些新闻不够好就只输出3条。
 
-但目标是尽可能接近20个。
+但：
+
+每一条必须满足：
+
+过去24小时
++
+非重复事件
++
+真实边际变化
++
+明确A股股票/ETF
++
+真实投资逻辑
+
+如果高质量事件不足：
+
+可以降低事件重要性标准，
+
+但不能降低：
+
+时间要求
+去重要求
+A股映射要求
+真实性要求。
 
 ============================================================
-输出格式
+十四、输出格式
 ============================================================
 
-只返回JSON。
-
-格式：
+只输出JSON：
 
 {{
-    "signal": "TOP_20_EVENTS",
+    "signal": "TWENTY_EVENTS",
 
     "events": [
-
         {{
             "rank": 1,
 
             "title": "",
 
-            "category": "",
+            "category":
+            "macro|policy|technology|company|industry_chain|science|market_event",
 
             "event_cluster": "",
 
@@ -747,128 +796,128 @@ A股映射验证
 
             "market_consensus": "",
 
+            "expectation_gap": "high|medium|low",
+
             "expectation_gap_detail": "",
 
             "market_price_reaction": "",
 
-            "market_mispricing": "",
-
             "industry_chain_logic": "",
 
             "a_share_idea": {{
-
                 "name": "",
                 "ticker": "",
                 "type": "stock|ETF",
-
                 "logic": "",
-
-                "directness": "DIRECT|INDIRECT|SECOND_ORDER",
-
-                "current_price_reaction": "",
-
-                "valuation_room": ""
-
+                "directness":
+                "DIRECT|INDIRECT|SECOND_ORDER"
             }},
 
             "us_reference": [],
 
             "speaker": {{
-
                 "name": null,
                 "role": null,
                 "statement_type": null,
                 "core_view": null
-
             }},
 
             "investment_thesis": "",
 
-            "earnings_impact": "",
-
-            "valuation_impact": "",
-
-            "future_1_4_weeks": {{
-
-                "base_case": "",
-                "bull_case": "",
-                "bear_case": ""
-
-            }},
+            "future_1_4_weeks": "",
 
             "key_catalysts": [],
 
             "key_risks": [],
 
-            "what_to_watch_next": [],
-
-            "direction": "positive|negative|mixed",
-
-            "scores": {{
-
-                "novelty": 0,
-                "economic_impact": 0,
-                "transmission": 0,
-                "expectation_gap": 0,
-                "market_mispricing": 0,
-                "a_share_mapping": 0,
-                "catalyst_strength": 0,
-                "investment_score": 0
-
-            }}
-
+            "investment_score": 0
         }}
-
     ]
-
 }}
 
 ============================================================
-最终硬性要求
+十五、字段要求
 ============================================================
 
-1. 只返回JSON。
+news_summary：
 
-2. 最多20个事件。
+用一句话简单说明发生了什么。
 
-3. 目标20个事件。
+what_changed：
 
-4. 每个事件必须是独立事件。
+必须明确说明：
 
-5. 同一事件不同媒体报道必须合并。
+“昨天和今天相比，新增了什么？”
 
-6. 不允许标题不同但本质相同的事件重复出现。
+investment_thesis：
 
-7. 每个事件必须有明确A股股票或ETF。
+说明为什么可能影响A股。
 
-8. 不允许纯概念映射。
+future_1_4_weeks：
 
-9. 必须考虑最新行情。
+说明未来1-4周可能怎么演绎。
 
-10. 必须考虑预期差。
+investment_score：
 
-11. 必须分析产业链。
+0-100。
 
-12. 必须给出未来1～4周催化剂。
+参考：
 
-13. 政策事件正常情况下不超过4条。
+90-100：
+非常强的预期差，可能形成阶段性行情。
 
-14. 科技和产业链事件优先深入分析。
+80-89：
+较强预期差。
 
-15. 重要产业链人物发言可以作为独立事件，但必须存在新的基本面信息。
+70-79：
+值得关注。
 
-16. 不得编造公司、股票代码、ETF。
+60-69：
+一般。
 
-17. 不得使用24小时以前的旧事件作为核心事件。
+<60：
 
-18. 同一个产业链连续出现多个高度相关事件时，应合并。
+不要进入最终20条。
 
 ============================================================
-过去24小时新闻
+十六、绝对禁止
+============================================================
+
+禁止：
+
+编造新闻。
+
+编造股票。
+
+编造股票代码。
+
+编造价格。
+
+编造涨跌幅。
+
+编造人物观点。
+
+编造产业链关系。
+
+重复事件。
+
+旧新闻。
+
+纯概念映射。
+
+============================================================
+新闻数据
 ============================================================
 
 {news_text}
 
+============================================================
+最新市场数据
+============================================================
+
+{market_text}
+
+只返回JSON。
 """
 
 
@@ -876,29 +925,14 @@ A股映射验证
 # A股映射检查
 # ============================================================
 
-def get_events(result):
-
-    if not isinstance(result, dict):
-        return []
-
-    events = result.get(
-        "events",
-        []
-    )
-
-    if not isinstance(events, list):
-        return []
-
-    return events
-
-
 def has_valid_a_share_mapping(event):
 
     if not isinstance(event, dict):
         return False
 
     idea = event.get(
-        "a_share_idea"
+        "a_share_idea",
+        {}
     )
 
     if not isinstance(idea, dict):
@@ -923,7 +957,8 @@ def has_valid_a_share_mapping(event):
         "none",
         "n/a",
         "暂无",
-        "不确定"
+        "不确定",
+        "无法确定"
     }
 
     if name.lower() in invalid:
@@ -932,163 +967,466 @@ def has_valid_a_share_mapping(event):
     if ticker.lower() in invalid:
         return False
 
-    if len(logic) < 10:
+    if not logic:
+        return False
+
+    # 必须有6位A股代码
+    digits = (
+        ticker
+        .replace(".SH", "")
+        .replace(".SZ", "")
+        .replace(".BJ", "")
+        .replace("SH", "")
+        .replace("SZ", "")
+        .replace("BJ", "")
+    )
+
+    if not digits.isdigit():
+        return False
+
+    if len(digits) != 6:
         return False
 
     return True
 
 
 # ============================================================
-# A股映射二次修复
+# 事件去重
 # ============================================================
 
-def make_mapping_repair_prompt(
-    event,
-    market_text
-):
+def normalize_event_key(event):
 
-    return f"""
+    """
+    用事件标题 + 事件聚类做基础去重。
+    """
 
-你是一名A股产业链研究员。
+    title = str(
+        event.get("title", "")
+    ).lower().strip()
 
-现在已经确定下面这个全球事件。
+    cluster = str(
+        event.get("event_cluster", "")
+    ).lower().strip()
 
-你的任务不是重新判断事件是否重要。
+    text = f"{cluster}|{title}"
 
-你的唯一任务：
-
-为这个事件寻找最直接、最可靠的A股上市公司或者A股ETF。
-
-============================================================
-事件
-============================================================
-
-{json.dumps(
-    event,
-    ensure_ascii=False,
-    indent=2
-)}
-
-============================================================
-最新市场数据
-============================================================
-
-{market_text}
-
-============================================================
-要求
-============================================================
-
-必须：
-
-1. 找真实存在的A股上市公司或者A股ETF。
-
-2. 不允许纯概念股。
-
-3. 优先DIRECT。
-
-4. 必须解释：
-
-事件
-↓
-产业链
-↓
-公司收入/订单/成本/盈利
-↓
-估值
-↓
-股价
-
-5. 必须考虑当前股价。
-
-6. 如果股票已经大幅上涨，需要说明是否已经price in。
-
-7. 如果没有可靠映射，返回null。
-
-============================================================
-输出
-============================================================
-
-只返回JSON：
-
-{{
-    "a_share_idea": {{
-
-        "name": "",
-        "ticker": "",
-        "type": "stock|ETF",
-        "logic": "",
-        "directness": "DIRECT|INDIRECT|SECOND_ORDER",
-        "current_price_reaction": "",
-        "valuation_room": ""
-
-    }}
-}}
-
-或者：
-
-{{
-    "a_share_idea": null
-}}
-
-"""
-
-
-def repair_a_share_mapping(
-    event,
-    market_text
-):
-
-    try:
-
-        print(
-            "[BATCH] 启动A股映射二次分析..."
+    # 删除常见标点
+    for char in (
+        " ",
+        "，",
+        "。",
+        "、",
+        "：",
+        ":",
+        "！",
+        "!",
+        "？",
+        "?",
+        "-",
+        "_",
+        "/"
+    ):
+        text = text.replace(
+            char,
+            ""
         )
 
-        prompt = make_mapping_repair_prompt(
+    return text[:150]
+
+
+def deduplicate_events(events):
+
+    """
+    第一层事件级去重。
+
+    同一个 event_cluster 只保留最高分。
+    """
+
+    cluster_best = {}
+
+    for event in events:
+
+        if not isinstance(
             event,
-            market_text
+            dict
+        ):
+            continue
+
+        cluster = str(
+            event.get(
+                "event_cluster",
+                ""
+            )
+        ).strip()
+
+        if not cluster:
+            cluster = normalize_event_key(
+                event
+            )
+
+        score = float(
+            event.get(
+                "investment_score",
+                0
+            ) or 0
         )
 
-        response = call_deepseek(
-            prompt
-        )
+        if (
+            cluster not in cluster_best
+            or score >
+            float(
+                cluster_best[cluster].get(
+                    "investment_score",
+                    0
+                )
+            )
+        ):
+            cluster_best[cluster] = event
 
-        repaired = extract_json(
-            response
-        )
-
-        if not repaired:
-            return event
-
-        mapping = repaired.get(
-            "a_share_idea"
-        )
-
-        if not isinstance(mapping, dict):
-            return event
-
-        event["a_share_idea"] = mapping
-
-        print(
-            "[BATCH] A股映射补全："
-            f"{mapping.get('name', '')} "
-            f"{mapping.get('ticker', '')}"
-        )
-
-        return event
-
-    except Exception as e:
-
-        print(
-            f"[BATCH] A股映射修复失败：{e}"
-        )
-
-        return event
+    return list(
+        cluster_best.values()
+    )
 
 
 # ============================================================
-# 主流程
+# 新闻ID匹配
+# ============================================================
+
+def find_news_id_for_event(
+    event,
+    items
+):
+
+    source_ids = event.get(
+        "source_news_ids",
+        []
+    )
+
+    if isinstance(
+        source_ids,
+        list
+    ):
+
+        for news_id in source_ids:
+
+            try:
+                return int(news_id)
+            except Exception:
+                pass
+
+    title = str(
+        event.get(
+            "title",
+            ""
+        )
+    ).lower()
+
+    # 关键词匹配
+    keywords = [
+        x.strip()
+        for x in title.replace(
+            "：",
+            " "
+        ).split()
+        if len(x.strip()) >= 2
+    ]
+
+    best_id = None
+    best_score = 0
+
+    for item in items:
+
+        item_title = str(
+            item.get(
+                "title",
+                ""
+            )
+        ).lower()
+
+        score = 0
+
+        for keyword in keywords:
+
+            if keyword in item_title:
+                score += len(keyword)
+
+        if score > best_score:
+
+            best_score = score
+
+            best_id = item.get(
+                "id"
+            )
+
+    return best_id
+
+
+# ============================================================
+# 保存事件
+# ============================================================
+
+def save_event(
+    event,
+    rss_item_id
+):
+
+    if rss_item_id is None:
+        return False
+
+    idea = event.get(
+        "a_share_idea",
+        {}
+    )
+
+    score = float(
+        event.get(
+            "investment_score",
+            0
+        ) or 0
+    )
+
+    score_data = {
+
+        "category":
+        event.get(
+            "category",
+            "other"
+        ),
+
+        "event_type":
+        event.get(
+            "event_cluster",
+            event.get(
+                "title",
+                ""
+            )
+        )[:100],
+
+        "novelty":
+        event.get(
+            "expectation_gap",
+            "medium"
+        ) == "high"
+        and 90
+        or 70,
+
+        "economic_impact":
+        score,
+
+        "transmission":
+        80,
+
+        "expectation_gap":
+        {
+            "high": 90,
+            "medium": 65,
+            "low": 40
+        }.get(
+            event.get(
+                "expectation_gap",
+                "low"
+            ),
+            50
+        ),
+
+        "market_sensitivity":
+        70,
+
+        "event_score":
+        score,
+
+        "direction":
+        "positive",
+
+        "affected_assets":
+        json.dumps(
+            {
+                "a_share_idea":
+                idea,
+
+                "us_reference":
+                event.get(
+                    "us_reference",
+                    []
+                )
+            },
+            ensure_ascii=False
+        ),
+
+        "affected_industries":
+        event.get(
+            "category",
+            ""
+        ),
+
+        "rationale":
+        event.get(
+            "investment_thesis",
+            ""
+        ),
+
+        "second_order_effects":
+        event.get(
+            "future_1_4_weeks",
+            ""
+        ),
+
+        "risks":
+        "\n".join(
+            event.get(
+                "key_risks",
+                []
+            )
+        ),
+
+        "model":
+        "deepseek-20-events",
+
+        "scored_at":
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    insert_score(
+        rss_item_id,
+        score_data
+    )
+
+    return True
+
+
+# ============================================================
+# 政策数量控制
+# ============================================================
+
+def limit_policy_events(
+    events,
+    max_policy=3
+):
+
+    policy_events = []
+
+    non_policy_events = []
+
+    for event in events:
+
+        category = str(
+            event.get(
+                "category",
+                ""
+            )
+        ).lower()
+
+        if category == "policy":
+            policy_events.append(
+                event
+            )
+        else:
+            non_policy_events.append(
+                event
+            )
+
+    policy_events.sort(
+        key=lambda x: float(
+            x.get(
+                "investment_score",
+                0
+            ) or 0
+        ),
+        reverse=True
+    )
+
+    return (
+        non_policy_events
+        +
+        policy_events[:max_policy]
+    )
+
+
+# ============================================================
+# 最终事件选择
+# ============================================================
+
+def select_final_events(
+    events,
+    target=20
+):
+
+    # --------------------------------------------------------
+    # 1. 只保留有效A股映射
+    # --------------------------------------------------------
+
+    valid = [
+        event
+        for event in events
+        if has_valid_a_share_mapping(
+            event
+        )
+    ]
+
+    print(
+        f"[BATCH] 有效A股映射："
+        f"{len(valid)}/{len(events)}"
+    )
+
+    # --------------------------------------------------------
+    # 2. 事件去重
+    # --------------------------------------------------------
+
+    valid = deduplicate_events(
+        valid
+    )
+
+    print(
+        f"[BATCH] 事件级去重后："
+        f"{len(valid)}条"
+    )
+
+    # --------------------------------------------------------
+    # 3. 政策最多3条
+    # --------------------------------------------------------
+
+    valid = limit_policy_events(
+        valid,
+        max_policy=3
+    )
+
+    # --------------------------------------------------------
+    # 4. 按投资评分排序
+    # --------------------------------------------------------
+
+    valid.sort(
+        key=lambda x: float(
+            x.get(
+                "investment_score",
+                0
+            ) or 0
+        ),
+        reverse=True
+    )
+
+    # --------------------------------------------------------
+    # 5. 取20条
+    # --------------------------------------------------------
+
+    final = valid[:target]
+
+    # --------------------------------------------------------
+    # 6. 重新编号
+    # --------------------------------------------------------
+
+    for i, event in enumerate(
+        final,
+        1
+    ):
+        event["rank"] = i
+
+    return final
+
+
+# ============================================================
+# 主函数
 # ============================================================
 
 def run_batch(
@@ -1100,6 +1438,8 @@ def run_batch(
         "[BATCH] ===== GLOBAL MARKET EVENT RADAR ====="
     )
 
+    init_db()
+
     if current_time is None:
 
         current_time = datetime.now(
@@ -1107,22 +1447,22 @@ def run_batch(
         ).isoformat()
 
     print(
-        f"[BATCH] 当前时间：{current_time}"
+        f"[BATCH] 当前时间："
+        f"{current_time}"
     )
 
     print(
         "[BATCH] 时间窗口：过去24小时"
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 获取新闻
-    # ========================================================
+    # --------------------------------------------------------
 
     try:
 
         items = get_recent_news(
-            hours=24,
-            limit=200
+            hours=24
         )
 
     except Exception as e:
@@ -1131,7 +1471,7 @@ def run_batch(
             f"[BATCH] 获取新闻失败：{e}"
         )
 
-        return []
+        return None
 
     if not items:
 
@@ -1139,19 +1479,32 @@ def run_batch(
             "[BATCH] 过去24小时没有新闻"
         )
 
-        return []
+        return None
 
     print(
-        f"[BATCH] 获取新闻：{len(items)}条"
+        f"[BATCH] 获取新闻："
+        f"{len(items)}条"
     )
 
-    print(
-        "[BATCH] 使用最新市场数据"
-    )
+    # --------------------------------------------------------
+    # 市场数据
+    # --------------------------------------------------------
 
-    # ========================================================
-    # 构建Prompt
-    # ========================================================
+    if market_text != "unknown":
+
+        print(
+            "[BATCH] 使用最新市场数据"
+        )
+
+    else:
+
+        print(
+            "[BATCH] 市场数据不可用"
+        )
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     prompt = make_batch_prompt(
         items,
@@ -1160,12 +1513,13 @@ def run_batch(
     )
 
     print(
-        f"[BATCH] Prompt长度：{len(prompt)}字符"
+        f"[BATCH] Prompt长度："
+        f"{len(prompt)}字符"
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # LLM
-    # ========================================================
+    # --------------------------------------------------------
 
     print(
         "[BATCH] 使用DeepSeek..."
@@ -1180,14 +1534,20 @@ def run_batch(
     except Exception as e:
 
         print(
-            f"[BATCH] DeepSeek调用失败：{e}"
+            f"[BATCH] DeepSeek调用失败："
+            f"{e}"
         )
 
-        return []
+        return None
 
     print(
-        f"[BATCH] LLM返回长度：{len(raw)}字符"
+        f"[BATCH] LLM返回长度："
+        f"{len(raw)}字符"
     )
+
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
 
     result = extract_json(
         raw
@@ -1199,187 +1559,141 @@ def run_batch(
             "[BATCH] LLM JSON解析失败"
         )
 
-        return []
+        return None
 
-    events = get_events(
-        result
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        print(
+            "[BATCH] LLM返回不是JSON对象"
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # 获取候选
+    # --------------------------------------------------------
+
+    candidates = result.get(
+        "events",
+        []
+    )
+
+    if not isinstance(
+        candidates,
+        list
+    ):
+
+        print(
+            "[BATCH] events不是数组"
+        )
+
+        return None
+
+    print(
+        f"[BATCH] LLM返回候选："
+        f"{len(candidates)}条"
+    )
+
+    # --------------------------------------------------------
+    # 最终筛选
+    # --------------------------------------------------------
+
+    final_events = select_final_events(
+        candidates,
+        target=20
     )
 
     print(
-        f"[BATCH] LLM返回候选事件：{len(events)}个"
+        f"[BATCH] 最终事件："
+        f"{len(final_events)}条"
     )
 
-    if not events:
+    # --------------------------------------------------------
+    # 如果不足20条
+    # --------------------------------------------------------
+
+    if len(final_events) < 20:
 
         print(
-            "[BATCH] 没有候选事件"
+            f"[BATCH] 警告："
+            f"只有{len(final_events)}条有效事件，"
+            f"不足20条"
         )
 
-        return []
+    # --------------------------------------------------------
+    # 保存
+    # --------------------------------------------------------
 
-    # ========================================================
-    # A股映射二次验证
-    # ========================================================
+    saved_count = 0
 
-    valid_events = []
+    for event in final_events:
 
-    for event in events:
+        rss_item_id = find_news_id_for_event(
+            event,
+            items
+        )
 
-        if not has_valid_a_share_mapping(
-            event
-        ):
-
-            print(
-                "[BATCH] 事件缺少有效A股映射："
-                f"{event.get('title', '')}"
-            )
-
-            event = repair_a_share_mapping(
-                event,
-                market_text
-            )
-
-        if not has_valid_a_share_mapping(
-            event
-        ):
+        if rss_item_id is None:
 
             print(
-                "[BATCH] 淘汰：没有可靠A股/ETF映射"
+                "[BATCH] 无法匹配新闻ID："
+                + str(
+                    event.get(
+                        "title",
+                        ""
+                    )
+                )[:60]
             )
 
             continue
 
-        valid_events.append(
-            event
-        )
-
-    # ========================================================
-    # 排序
-    # ========================================================
-
-    def score_key(event):
-
-        scores = event.get(
-            "scores",
-            {}
-        )
-
         try:
 
-            return float(
-                scores.get(
-                    "investment_score",
-                    0
+            ok = save_event(
+                event,
+                rss_item_id
+            )
+
+            if ok:
+
+                saved_count += 1
+
+                idea = event.get(
+                    "a_share_idea",
+                    {}
                 )
-            )
 
-        except Exception:
-
-            return 0
-
-    valid_events.sort(
-        key=score_key,
-        reverse=True
-    )
-
-    # ========================================================
-    # 最多20条
-    # ========================================================
-
-    final_events = valid_events[:20]
-
-    # ========================================================
-    # 重新编号
-    # ========================================================
-
-    for index, event in enumerate(
-        final_events,
-        start=1
-    ):
-
-        event["rank"] = index
-
-    print(
-        "[BATCH] ========================================"
-    )
-
-    print(
-        f"[BATCH] FINAL EVENTS：{len(final_events)}个"
-    )
-
-    for event in final_events:
-
-        idea = event.get(
-            "a_share_idea",
-            {}
-        )
-
-        scores = event.get(
-            "scores",
-            {}
-        )
-
-        print(
-            f"[BATCH] "
-            f"{event.get('rank', '')}. "
-            f"{event.get('title', '')}"
-        )
-
-        print(
-            "[BATCH] A股："
-            f"{idea.get('name', '')} "
-            f"{idea.get('ticker', '')}"
-        )
-
-        print(
-            "[BATCH] Score："
-            f"{scores.get('investment_score', 0)}"
-        )
-
-    print(
-        "[BATCH] ========================================"
-    )
-
-    # ========================================================
-    # 保存
-    # ========================================================
-
-    saved = 0
-
-    for event in final_events:
-
-        try:
-
-            save_event(
-                event
-            )
-
-            saved += 1
+                print(
+                    f"[BATCH] "
+                    f"{event.get('rank')}. "
+                    f"{event.get('title', '')[:50]} "
+                    f"| "
+                    f"{idea.get('name', '')} "
+                    f"{idea.get('ticker', '')} "
+                    f"| "
+                    f"Score="
+                    f"{event.get('investment_score', 0)}"
+                )
 
         except Exception as e:
 
             print(
-                f"[BATCH] 保存事件失败：{e}"
+                f"[BATCH] 保存事件失败："
+                f"{e}"
             )
 
     print(
-        f"[BATCH] 事件保存完成：{saved}条"
+        f"[BATCH] 成功保存："
+        f"{saved_count}/{len(final_events)}"
     )
 
-    return final_events
+    return {
+        "signal":
+        "TWENTY_EVENTS",
 
-
-# ============================================================
-# 数据库保存
-# ============================================================
-
-def save_event(event):
-
-    """
-    当前版本只保留接口。
-
-    下一步修改 db.py 时，
-    会把这里正式接入 event_scores。
-    """
-
-    return True
+        "events":
+        final_events
+    }
