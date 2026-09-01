@@ -90,6 +90,7 @@ def insert_rss(item):
 
 
 def insert_score(rss_item_id, score_data):
+    """插入评分"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -123,10 +124,7 @@ def insert_score(rss_item_id, score_data):
 
 
 def get_recent_scored(min_score=0, limit=100):
-    """
-    获取评分事件，默认不设门槛（min_score=0）
-    返回所有有评分的记录，按评分降序排列
-    """
+    """获取评分事件，默认不设门槛"""
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -203,7 +201,7 @@ def parse_datetime(value):
 
 
 # ============================================================
-# DeepSeek 调用（使用 requests）
+# DeepSeek 调用
 # ============================================================
 
 def call_deepseek(prompt):
@@ -260,12 +258,12 @@ def extract_json(text):
 
 
 # ============================================================
-# 构建批量提示词（多事件候选）
+# 构建批量提示词（强制输出至少5个事件）
 # ============================================================
 
 def make_batch_prompt(items, current_time, market_text):
     news_blocks = []
-    for i, item in enumerate(items):
+    for i, item in enumerate(items[:150]):  # 限制前150条，避免超长
         news_blocks.append(f"""
 ================ NEWS {i} ================
 
@@ -274,7 +272,7 @@ SOURCE: {item.get("source", "")}
 PUBLISHED: {item.get("published", "")}
 TITLE: {item.get("title", "")}
 SUMMARY: {item.get("summary", "")}
-CONTENT: {item.get("content", "")[:3000]}
+CONTENT: {item.get("content", "")[:2000]}
 URL: {item.get("url", "")}
 
 ===========================================
@@ -291,13 +289,16 @@ URL: {item.get("url", "")}
 ============================================================
 
 从过去24小时新闻中，识别出所有具有潜在预期差的事件。
-不限制数量，但最多输出10个。
+
+**你必须输出至少5个、最多10个候选事件。**
+
+不要只选1个。如果有多个事件有预期差，全部列出。
 
 筛选标准（按重要性排序）：
-1. 预期差：市场定价 vs 事件实际含义的差距（最重要）
+1. 预期差：市场定价 vs 事件实际含义的差距
 2. 边际变化：相比昨天，今天发生了什么新的事实
-3. 产业链传导：能否影响至少2层产业链
-4. A股映射：是否能够映射到明确的A股标的
+3. 产业链传导：能否影响至少1层产业链（不强制2层）
+4. A股映射：优先选择有明确A股映射的事件，但**允许使用行业ETF或概念股作为替代**
 
 重点关注"异常"信号：
 - 价格异常：某股票突然大涨/大跌但没有对应新闻
@@ -307,7 +308,7 @@ URL: {item.get("url", "")}
 - 产业链异常：上游产能突然收缩/扩张
 
 ============================================================
-输出格式（最多10个事件）
+输出格式（必须至少5个事件）
 ============================================================
 
 {{
@@ -323,8 +324,8 @@ URL: {item.get("url", "")}
             "abnormality_score": 0-100,
             "abnormality_reason": "为什么认为异常",
             "a_share_idea": {{
-                "name": "公司名称",
-                "ticker": "股票代码",
+                "name": "公司或ETF名称",
+                "ticker": "股票或ETF代码",
                 "type": "stock|ETF",
                 "logic": "投资逻辑",
                 "directness": "DIRECT|INDIRECT|SECOND_ORDER"
@@ -334,7 +335,8 @@ URL: {item.get("url", "")}
             "investment_thesis": "投资要点",
             "key_risks": ["风险1", "风险2"],
             "catalyst_timeline": "未来催化剂时间"
-        }}
+        }},
+        ...
     ]
 }}
 
@@ -345,11 +347,12 @@ URL: {item.get("url", "")}
 硬性要求
 ============================================================
 
-1. 最多输出10个事件，按预期差从高到低排序
-2. 只包含有明确A股映射的事件
-3. 如果某事件已经被市场充分定价，排除
-4. 不要只输出"最大"的新闻，要输出"最异常"的新闻
-5. 只返回JSON
+1. **必须输出至少5个事件**，最多10个
+2. 按预期差从高到低排序
+3. 优先选择有A股映射的事件，但**不要因为A股映射不明确就完全排除**
+4. 如果某事件已经被市场充分定价，排除
+5. 不要只输出"最大"的新闻，要输出"最异常"的新闻
+6. 只返回JSON
 
 ============================================================
 过去24小时新闻
@@ -391,20 +394,15 @@ def save_single_event(event, rss_item_id):
         "scored_at": datetime.now(timezone.utc).isoformat()
     }
     insert_score(rss_item_id, score_data)
-    print(f"[BATCH] 保存事件：{event.get('title', '')[:50]} (评分：{event.get('abnormality_score', 0)})")
 
 
 def find_news_id_for_event(event, items):
-    """
-    尝试为事件匹配对应的新闻ID
-    优先通过标题关键词匹配，否则返回第一条新闻的ID
-    """
-    # 方法1：通过新闻摘要关键词匹配
+    """尝试为事件匹配对应的新闻ID"""
+    # 方法1：通过标题关键词匹配
     title_keywords = event.get("title", "")[:30].strip()
     if title_keywords and len(title_keywords) > 5:
         for item in items:
             item_title = item.get("title", "")
-            # 检查关键词是否在新闻标题中
             if title_keywords.lower() in item_title.lower():
                 return item.get("id")
     
@@ -421,6 +419,70 @@ def find_news_id_for_event(event, items):
         return items[0].get("id")
     
     return None
+
+
+# ============================================================
+# 保存 ONE BIG EVENT（兼容旧模式）
+# ============================================================
+
+def save_one_big_event(result):
+    """把 ONE BIG EVENT 转换成 event_scores 表结构"""
+    event = result.get("event", {})
+    scores = result.get("scores", {})
+    idea = event.get("a_share_idea", {})
+
+    source_ids = event.get("source_news_ids", [])
+    rss_item_id = None
+
+    if source_ids:
+        try:
+            rss_item_id = int(source_ids[0])
+        except Exception:
+            pass
+
+    if rss_item_id is None:
+        items = get_recent_news(hours=24)
+        if items:
+            title_keywords = event.get("title", "")[:30].strip()
+            if title_keywords and len(title_keywords) > 5:
+                for item in items:
+                    if title_keywords.lower() in item.get("title", "").lower():
+                        rss_item_id = item.get("id")
+                        break
+            if rss_item_id is None:
+                rss_item_id = items[0].get("id")
+
+    if rss_item_id is None:
+        print("[BATCH] 没有有效rss_item_id，跳过数据库保存")
+        return
+
+    score_data = {
+        "category": event.get("category", "other"),
+        "event_type": event.get("event_cluster", "")[:100],
+        "novelty": scores.get("novelty", 0),
+        "economic_impact": scores.get("fundamental_impact", 0),
+        "transmission": scores.get("transmission", 0),
+        "expectation_gap": scores.get("expectation_gap", 50),
+        "market_sensitivity": scores.get("market_mispricing", 0),
+        "event_score": scores.get("investment_score", 0),
+        "direction": event.get("direction", "unknown"),
+        "affected_assets": json.dumps({
+            "a_share": idea,
+            "us_reference": event.get("us_reference", []),
+            "expectation_gap_detail": event.get("expectation_gap_detail", ""),
+            "key_catalysts": event.get("key_catalysts", []),
+            "future_1_4_weeks": event.get("future_1_4_weeks", {})
+        }, ensure_ascii=False),
+        "affected_industries": event.get("category", ""),
+        "rationale": event.get("investment_thesis", ""),
+        "second_order_effects": event.get("future_1_4_weeks", {}).get("base_case", ""),
+        "risks": "\n".join(event.get("key_risks", [])),
+        "model": "deepseek-one-big-event",
+        "scored_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    insert_score(rss_item_id, score_data)
+    print(f"[BATCH] ONE BIG EVENT 已保存，A股：{idea.get('name', '')} ({idea.get('ticker', '')})")
 
 
 # ============================================================
@@ -464,6 +526,18 @@ def run_batch(market_text="unknown"):
         print("[BATCH] 没有识别到有预期差的事件")
         return None
 
+    # ---- 兼容两种模式 ----
+    if result.get("signal") == "ONE_BIG_EVENT":
+        print("[BATCH] 使用 ONE_BIG_EVENT 模式")
+        save_one_big_event(result)
+        
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        count = cur.execute("SELECT COUNT(*) FROM event_scores").fetchone()[0]
+        print(f"[BATCH] 验证：event_scores 表中当前共有 {count} 条记录")
+        con.close()
+        return result
+
     if result.get("signal") != "MULTIPLE_CANDIDATES":
         print(f"[BATCH] 信号格式异常，预期 MULTIPLE_CANDIDATES，实际: {result.get('signal')}")
         return None
@@ -476,10 +550,8 @@ def run_batch(market_text="unknown"):
     print(f"[BATCH] 共识别出 {len(candidates)} 个候选事件")
     candidates.sort(key=lambda x: x.get("abnormality_score", 0), reverse=True)
 
-    # 保存每个事件
     saved_count = 0
     for idx, evt in enumerate(candidates):
-        # 尝试匹配对应的新闻ID
         rss_item_id = find_news_id_for_event(evt, items)
         if rss_item_id is None:
             print(f"[BATCH] 跳过保存，无关联新闻ID：{evt.get('title', '')[:30]}")
@@ -490,7 +562,7 @@ def run_batch(market_text="unknown"):
 
     print(f"[BATCH] 成功保存 {saved_count}/{len(candidates)} 个事件")
 
-    # ---- 验证：查询 event_scores 表记录数 ----
+    # 验证
     try:
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
