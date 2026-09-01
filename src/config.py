@@ -25,8 +25,8 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_TO = os.getenv("MAIL_TO")
 MAIL_FROM = os.getenv("MAIL_FROM")
 
-MIN_SCORE_TO_EMAIL = int(os.getenv("MIN_SCORE_TO_EMAIL", 60))
-MAX_EMAIL_EVENTS = int(os.getenv("MAX_EMAIL_EVENTS", 10))
+MIN_SCORE_TO_EMAIL = int(os.getenv("MIN_SCORE_TO_EMAIL", 0))
+MAX_EMAIL_EVENTS = int(os.getenv("MAX_EMAIL_EVENTS", 100))  # 调大，便于取更多候选
 
 # ============================================================
 # 数据库配置
