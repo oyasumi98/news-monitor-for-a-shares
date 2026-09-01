@@ -220,7 +220,7 @@ def call_deepseek(prompt):
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
-        "max_tokens": 8000
+        "max_tokens": 4000
     }
     resp = requests.post(
         f"{base_url}/chat/completions",
@@ -233,19 +233,14 @@ def call_deepseek(prompt):
 
 
 def extract_json(text):
-    """
-    从 LLM 返回的文本中提取 JSON。
-    支持：代码块包裹、文本中嵌入 JSON、多个 JSON 对象。
-    """
     if not text:
         return None
-
     text = text.strip()
-    print(f"[DEBUG] extract_json 输入长度: {len(text)} 字符")
-    print(f"[DEBUG] 前 500 字符: {text[:500]}...")
-    print(f"[DEBUG] 后 500 字符: {text[-500:]}...")
+    print(f"[DEBUG] extract_json 输入长度: {len(text)}")
+    print(f"[DEBUG] 前 500 字符: {text[:500]}")
+    print(f"[DEBUG] 后 500 字符: {text[-500:]}")
 
-    # 1. 移除 markdown 代码块
+    # 移除 markdown 代码块
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3:
@@ -253,66 +248,35 @@ def extract_json(text):
             if lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-        print(f"[DEBUG] 移除代码块后长度: {len(text)}")
 
-    # 2. 尝试直接解析
-    try:
-        result = json.loads(text)
-        print("[DEBUG] 直接解析成功")
-        return result
-    except json.JSONDecodeError as e:
-        print(f"[DEBUG] 直接解析失败: {e}")
-
-    # 3. 尝试从第一个 { 到最后一个 } 提取
+    # 尝试提取最外层 JSON（从第一个 { 到最后一个 }）
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        candidate = text[start:end + 1]
-        print(f"[DEBUG] 提取候选 JSON，长度: {len(candidate)}")
+        candidate = text[start:end+1]
+        # 尝试解析
         try:
-            result = json.loads(candidate)
-            print("[DEBUG] 候选 JSON 解析成功")
-            return result
+            return json.loads(candidate)
         except json.JSONDecodeError as e:
             print(f"[DEBUG] 候选 JSON 解析失败: {e}")
-            # 打印候选内容的前 300 字符帮助调试
-            print(f"[DEBUG] 候选内容前 300 字符: {candidate[:300]}...")
-
-    # 4. 尝试逐个解析 JSON 对象（如果返回了多个）
-    # 使用正则找到所有 JSON 对象
-    import re
-    json_pattern = r'\{[^{}]*\}'
-    matches = re.findall(json_pattern, text)
-    if matches:
-        print(f"[DEBUG] 正则匹配到 {len(matches)} 个 JSON 片段")
-        for i, match in enumerate(matches):
+            # 尝试修复常见问题：尾随逗号
+            import re
+            # 移除尾随逗号
+            fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
             try:
-                result = json.loads(match)
-                print(f"[DEBUG] 第 {i+1} 个 JSON 片段解析成功")
-                return result
-            except json.JSONDecodeError:
-                continue
+                return json.loads(fixed)
+            except:
+                pass
 
-    # 5. 如果上述都失败，尝试修复常见的 JSON 问题
-    # 例如：去除尾随逗号、单引号替换为双引号等
+    # 如果还是失败，保存原始内容到文件以便调试（在 Actions 中可通过 artifacts 下载）
     try:
-        import re
-        # 去除尾随逗号（在 } 或 ] 之前）
-        fixed = re.sub(r',\s*([}\]])', r'\1', text)
-        # 尝试提取并解析
-        start = fixed.find("{")
-        end = fixed.rfind("}")
-        if start >= 0 and end > start:
-            candidate = fixed[start:end + 1]
-            result = json.loads(candidate)
-            print("[DEBUG] 修复后解析成功")
-            return result
-    except Exception as e:
-        print(f"[DEBUG] 修复后解析仍失败: {e}")
+        with open("debug_raw.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+        print("[DEBUG] 原始返回已保存到 debug_raw.txt")
+    except:
+        pass
 
-    print("[DEBUG] 所有解析方法均失败")
     return None
-
 
 # ============================================================
 # 构建批量提示词（强制输出至少5个事件）
