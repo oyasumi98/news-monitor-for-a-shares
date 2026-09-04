@@ -6,6 +6,49 @@ from .config import *
 from .db import get_recent_scored
 
 
+def select_top_pick(events):
+    """选出当日最推荐的股票"""
+    best = None
+    best_score = -1
+    
+    for event in events:
+        extra = {}
+        try:
+            affected_raw = event.get("affected_assets", "{}")
+            if isinstance(affected_raw, str):
+                extra = json.loads(affected_raw) if affected_raw else {}
+            else:
+                extra = affected_raw if affected_raw else {}
+        except:
+            pass
+        
+        a_share = extra.get("a_share", {})
+        if not a_share.get("name"):
+            continue
+        
+        score = float(event.get("event_score", 0))
+        novelty = float(event.get("novelty", 0))
+        directness = a_share.get("directness", "INDIRECT")
+        
+        if directness == "DIRECT":
+            score += 10
+        elif directness == "INDIRECT":
+            score += 5
+        
+        if score > best_score:
+            best_score = score
+            best = {
+                "name": a_share.get("name"),
+                "ticker": a_share.get("ticker"),
+                "logic": a_share.get("logic", ""),
+                "event_score": event.get("event_score", 0),
+                "title": event.get("title", ""),
+                "direction": event.get("direction", "unknown")
+            }
+    
+    return best
+
+
 def send_email():
     rows = get_recent_scored(min_score=0, limit=100)
     if not rows:
@@ -29,8 +72,23 @@ def send_email():
         print("[MAIL] 没有符合条件的事件")
         return
 
-    parts = ["<html><body><h2>Global Market Event Radar - Top 20 (类别去重)</h2>"]
+    parts = ["<html><body><h2>🌍 全球市场事件雷达 - 今日精选</h2>"]
 
+    # ---- 推荐板块 ----
+    top_pick = select_top_pick(best_events)
+    if top_pick:
+        direction_text = "🟢 利好" if top_pick['direction'] == 'positive' else "🔴 利空" if top_pick['direction'] == 'negative' else "🟡 中性"
+        parts.append(f"""
+        <div style="background: #f0f7ff; border: 2px solid #1890ff; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+        <h3>⭐ 今日最推荐：{top_pick['name']}（{top_pick['ticker']}）</h3>
+        <p><b>驱动事件：</b>{top_pick['title']}</p>
+        <p><b>方向：</b>{direction_text}</p>
+        <p><b>核心逻辑：</b>{top_pick['logic']}</p>
+        <p><b>事件评分：</b>{top_pick['event_score']:.0f}</p>
+        </div>
+        """)
+
+    # ---- 事件列表 ----
     for i, row in enumerate(best_events, 1):
         r = dict(row)
 
@@ -63,7 +121,6 @@ def send_email():
         a_logic = a_share.get("logic", "")
         a_directness = a_share.get("directness", "")
 
-        us_ref = extra.get("us_reference", [])
         exp_gap_detail = extra.get("expectation_gap_detail", "")
         catalysts = extra.get("key_catalysts", [])
         catalyst_text = "\n".join(catalysts) if catalysts else ""
@@ -78,13 +135,15 @@ def send_email():
 
         parts.append(f"""
         <hr>
-        <h3>{i}. {r["title"]} - MEI {score:.0f}</h3>
+        <h3>{i}. {r["title"]}</h3>
         <p><b>类型：</b>{r["category"]} / {r["event_type"]}</p>
-        <p><b>评分：</b>Novelty {novelty:.0f}; Impact {impact:.0f}; Transmission {trans:.0f}; Expectation Gap {gap:.0f}; Sensitivity {sens:.0f}</p>
+        <p><b>评分：</b>新颖性 {novelty:.0f}；影响 {impact:.0f}；传导 {trans:.0f}；预期差 {gap:.0f}；敏感性 {sens:.0f}</p>
         <p><b>{dir_emoji} 方向：</b>{dir_label}</p>
-        <p><b>📌 预期差：</b>{gap_label} | {exp_gap_detail}</p>
-        <p><b>📌 发生了什么：</b>{r.get("news_summary", "") or r.get("rationale", "")}</p>
+        <p><b>📌 核心事件：</b>{r.get("news_summary", "") or r.get("rationale", "")}</p>
         """)
+
+        if industry_chain:
+            parts.append(f"<p><b>🔗 逻辑推导：</b>{industry_chain}</p>")
 
         if a_name and a_ticker:
             parts.append(f"""
@@ -94,8 +153,8 @@ def send_email():
             <br>逻辑：{a_logic}</p>
             """)
 
-        if industry_chain:
-            parts.append(f"<p><b>🔗 产业链逻辑：</b>{industry_chain}</p>")
+        if exp_gap_detail:
+            parts.append(f"<p><b>📊 预期差：</b>{gap_label} | {exp_gap_detail}</p>")
 
         if catalyst_text:
             parts.append(f"<p><b>⏰ 催化剂：</b><br>{catalyst_text}</p>")
@@ -103,12 +162,12 @@ def send_email():
         if r.get("risks"):
             parts.append(f"<p><b>⚠️ 风险：</b>{r['risks']}</p>")
 
-        parts.append(f'<p><a href="{r["url"]}">查看原文</a></p>')
+        parts.append(f'<p><a href="{r["url"]}">📎 查看原文</a></p>')
 
     parts.append("</body></html>")
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Global Market Event Radar | 精选 {len(best_events)} 个事件"
+    msg["Subject"] = f"🌍 全球市场事件雷达 | 精选 {len(best_events)} 个事件"
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
     msg.attach(MIMEText("\n".join(parts), "html", "utf-8"))
