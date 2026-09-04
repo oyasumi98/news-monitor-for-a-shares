@@ -2,6 +2,7 @@ import sqlite3
 import json
 import os
 import requests
+import re
 from datetime import datetime, timezone, timedelta
 
 from .config import DB_PATH
@@ -143,37 +144,42 @@ def get_recent_scored(min_score=0, limit=100):
 
 
 # ============================================================
-# 获取过去24小时新闻
+# 获取过去24小时新闻（唯一版本，带 limit 参数）
 # ============================================================
 
-def get_recent_news(hours=24):
+def get_recent_news(hours=24, limit=None):
+    """
+    从 rss_items 表中获取过去 hours 小时内的新闻
+
+    Args:
+        hours: 时间范围（小时），默认24
+        limit: 最大返回条数，默认 None 表示不限制
+
+    Returns:
+        list: 新闻列表，每个元素为 dict
+    """
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
-    rows = cur.execute("""
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff_str = cutoff.isoformat()
+
+    query = """
         SELECT id, guid, published, source, title, url, summary, content, collected_at
         FROM rss_items
-        ORDER BY id DESC
-    """).fetchall()
-    con.close()
+        WHERE collected_at >= ?
+        ORDER BY collected_at DESC
+    """
+    params = [cutoff_str]
 
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
-    result = []
-    for row in rows:
-        item = dict(row)
-        dt = parse_datetime(item.get("published"))
-        if dt is None:
-            dt = parse_datetime(item.get("collected_at"))
-        if dt is None:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc)
-        if dt < cutoff:
-            continue
-        result.append(item)
-    return result
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    rows = cur.execute(query, params).fetchall()
+    con.close()
+    return [dict(row) for row in rows]
 
 
 def parse_datetime(value):
@@ -240,7 +246,6 @@ def extract_json(text):
     print(f"[DEBUG] 前 500 字符: {text[:500]}")
     print(f"[DEBUG] 后 500 字符: {text[-500:]}")
 
-    # 移除 markdown 代码块
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3:
@@ -249,26 +254,20 @@ def extract_json(text):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
 
-    # 尝试提取最外层 JSON（从第一个 { 到最后一个 }）
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
         candidate = text[start:end+1]
-        # 尝试解析
         try:
             return json.loads(candidate)
         except json.JSONDecodeError as e:
             print(f"[DEBUG] 候选 JSON 解析失败: {e}")
-            # 尝试修复常见问题：尾随逗号
-            import re
-            # 移除尾随逗号
             fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
             try:
                 return json.loads(fixed)
             except:
                 pass
 
-    # 如果还是失败，保存原始内容到文件以便调试（在 Actions 中可通过 artifacts 下载）
     try:
         with open("debug_raw.txt", "w", encoding="utf-8") as f:
             f.write(text)
@@ -278,20 +277,19 @@ def extract_json(text):
 
     return None
 
+
 # ============================================================
-# 构建批量提示词（强制输出至少5个事件）
+# 构建批量提示词（包含情绪指标和逻辑链要求）
 # ============================================================
 
-def make_batch_prompt(items, current_time, market_text):
+def make_batch_prompt(items, current_time, market_text, sentiment_text=""):
     news_blocks = []
     for i, item in enumerate(items[:150]):
-        # ---- 关键修复：安全处理新闻内容中的 { 和 } ----
         def safe_str(s):
             if s is None:
                 return ""
-            # 替换 { 和 } 为不可见字符，防止 f-string 解析错误
             return str(s).replace("{", "【").replace("}", "】")
-        
+
         news_blocks.append(f"""
 ================ NEWS {i} ================
 
@@ -313,6 +311,18 @@ URL: {safe_str(item.get("url", ""))}
 当前时间：{current_time}
 
 ============================================================
+市场行情快照
+============================================================
+
+{market_text if market_text else "无可用行情数据"}
+
+============================================================
+市场情绪指标
+============================================================
+
+{sentiment_text if sentiment_text else "无可用情绪数据"}
+
+============================================================
 你的核心任务
 ============================================================
 
@@ -325,8 +335,8 @@ URL: {safe_str(item.get("url", ""))}
 筛选标准（按重要性排序）：
 1. 预期差：市场定价 vs 事件实际含义的差距
 2. 边际变化：相比昨天，今天发生了什么新的事实
-3. 产业链传导：能否影响至少1层产业链（不强制2层）
-4. A股映射：优先选择有明确A股映射的事件，但**允许使用行业ETF或概念股作为替代**
+3. 产业链传导：能否影响至少1层产业链
+4. A股映射：优先选择有明确A股映射的事件，允许使用行业ETF或概念股作为替代
 
 重点关注"异常"信号：
 - 价格异常：某股票突然大涨/大跌但没有对应新闻
@@ -345,23 +355,26 @@ URL: {safe_str(item.get("url", ""))}
         {{
             "title": "事件标题",
             "category": "macro|policy|technology|company|industry_chain|market_event",
-            "news_summary": "一句话总结",
+            "news_summary": "事件本质（一句话概括）",
             "what_changed": "发生了什么边际变化",
+            "logic_chain": "事件 → A → B → C → 最终影响（至少3步逻辑链）",
+            "direction": "positive|negative|mixed",
+            "direction_reason": "方向判断的理由（2-3句话）",
             "expectation_gap": "high|medium|low",
-            "expectation_gap_detail": "具体预期差描述",
+            "expectation_gap_detail": "具体预期差描述（市场认为...但实际上...）",
             "abnormality_score": 0-100,
             "abnormality_reason": "为什么认为异常",
             "a_share_idea": {{
                 "name": "公司或ETF名称",
                 "ticker": "股票或ETF代码",
                 "type": "stock|ETF",
-                "logic": "投资逻辑",
+                "logic": "推荐逻辑（含估值空间）",
                 "directness": "DIRECT|INDIRECT|SECOND_ORDER"
             }},
-            "us_reference": [],
-            "industry_chain_logic": "产业链传导",
-            "investment_thesis": "投资要点",
-            "key_risks": ["风险1", "风险2"],
+            "us_reference": ["美股参考标的1", "美股参考标的2"],
+            "industry_chain_logic": "产业链传导（简版）",
+            "investment_thesis": "投资要点（不超过50字）",
+            "key_risks": ["风险1（用'如果…那么…'句式）", "风险2"],
             "catalyst_timeline": "未来催化剂时间"
         }}
     ]
@@ -375,11 +388,12 @@ URL: {safe_str(item.get("url", ""))}
 ============================================================
 
 1. **必须输出至少5个事件**，最多20个
-2. 按预期差从高到低排序
-3. 优先选择有A股映射的事件，但**不要因为A股映射不明确就完全排除**
-4. 如果某事件已经被市场充分定价，排除
-5. 不要只输出"最大"的新闻，要输出"最异常"的新闻
-6. 只返回JSON
+2. **每个事件必须包含完整的逻辑链**（至少3步）
+3. 按预期差从高到低排序
+4. 优先选择有A股映射的事件，但不要因为A股映射不明确就完全排除
+5. 如果某事件已经被市场充分定价，排除
+6. **风险必须用'如果…那么…'句式**
+7. 只返回JSON
 
 ============================================================
 过去24小时新闻
@@ -387,7 +401,6 @@ URL: {safe_str(item.get("url", ""))}
 
 {news_text}
 """
-
 
 
 # ============================================================
@@ -405,14 +418,16 @@ def save_single_event(event, rss_item_id):
         "expectation_gap": 50,
         "market_sensitivity": 50,
         "event_score": event.get("abnormality_score", 0),
-        "direction": "unknown",
+        "direction": event.get("direction", "unknown"),
         "affected_assets": json.dumps({
             "a_share": event.get("a_share_idea", {}),
             "us_reference": event.get("us_reference", []),
             "expectation_gap_detail": event.get("expectation_gap_detail", ""),
             "industry_chain_logic": event.get("industry_chain_logic", ""),
             "key_risks": event.get("key_risks", []),
-            "catalyst_timeline": event.get("catalyst_timeline", "")
+            "catalyst_timeline": event.get("catalyst_timeline", ""),
+            "logic_chain": event.get("logic_chain", ""),
+            "direction_reason": event.get("direction_reason", "")
         }, ensure_ascii=False),
         "affected_industries": event.get("category", ""),
         "rationale": event.get("investment_thesis", ""),
@@ -422,30 +437,27 @@ def save_single_event(event, rss_item_id):
         "scored_at": datetime.now(timezone.utc).isoformat()
     }
     insert_score(rss_item_id, score_data)
+    print(f"[BATCH] 保存事件：{event.get('title', '')[:50]} (评分：{event.get('abnormality_score', 0)})")
 
 
 def find_news_id_for_event(event, items):
     """尝试为事件匹配对应的新闻ID"""
-    # 方法1：通过标题关键词匹配
     title_keywords = event.get("title", "")[:30].strip()
     if title_keywords and len(title_keywords) > 5:
         for item in items:
             item_title = item.get("title", "")
             if title_keywords.lower() in item_title.lower():
                 return item.get("id")
-    
-    # 方法2：通过事件聚类名称匹配
+
     cluster = event.get("category", "")
     if cluster and len(cluster) > 3:
         for item in items:
             item_title = item.get("title", "")
             if cluster.lower() in item_title.lower():
                 return item.get("id")
-    
-    # 方法3：返回第一条新闻的ID（兜底）
+
     if items:
         return items[0].get("id")
-    
     return None
 
 
@@ -514,69 +526,43 @@ def save_one_big_event(result):
 
 
 # ============================================================
-# 主函数
-# ============================================================
-# ============================================================
-# 获取过去24小时新闻
+# 主函数 run_batch
 # ============================================================
 
-def get_recent_news(hours=24, limit=None):
-    """
-    从 rss_items 表中获取过去 hours 小时内的新闻
-    
-    Args:
-        hours: 时间范围（小时），默认24
-        limit: 最大返回条数，默认 None 表示不限制
-    
-    Returns:
-        list: 新闻列表，每个元素为 dict
-    """
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
-    
-    # 计算时间阈值
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    cutoff_str = cutoff.isoformat()
-    
-    # 构建查询
-    query = """
-        SELECT id, guid, published, source, title, url, summary, content, collected_at
-        FROM rss_items
-        WHERE collected_at >= ?
-        ORDER BY collected_at DESC
-    """
-    params = [cutoff_str]
-    
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
-    
-    rows = cur.execute(query, params).fetchall()
-    con.close()
-    
-    return [dict(row) for row in rows]
-    
 def run_batch(market_text="unknown"):
     print("[BATCH] ===== GLOBAL MARKET SURPRISE DETECTOR =====")
     init_db()
 
     now = datetime.now(timezone.utc)
     print(f"[BATCH] 当前UTC时间：{now.isoformat()}")
+
+    # 获取新闻
     items = get_recent_news(hours=24)
     print(f"[BATCH] 获取新闻：{len(items)}条")
     if not items:
         print("[BATCH] 没有新闻")
         return None
 
+    # 获取情绪数据
+    sentiment_text = ""
+    try:
+        from .market_data import get_market_sentiment, format_sentiment_for_prompt
+        sentiment = get_market_sentiment()
+        sentiment_text = format_sentiment_for_prompt(sentiment)
+        print("[BATCH] 市场情绪数据获取成功")
+    except Exception as e:
+        print(f"[BATCH] 情绪数据获取失败: {e}")
+
     if market_text != "unknown":
         print("[BATCH] 使用最新市场数据")
     else:
         print("[BATCH] 市场数据不可用")
 
-    prompt = make_batch_prompt(items, now.isoformat(), market_text)
+    # 生成提示词
+    prompt = make_batch_prompt(items, now.isoformat(), market_text, sentiment_text)
     print(f"[BATCH] Prompt长度：{len(prompt)}字符")
 
+    # 调用LLM
     print("[BATCH] 调用DeepSeek...")
     try:
         raw = call_deepseek(prompt)
@@ -587,12 +573,9 @@ def run_batch(market_text="unknown"):
     print(f"[BATCH] LLM返回长度：{len(raw)}字符")
     result = extract_json(raw)
     if not result:
-        print("[BATCH] JSON解析失败，尝试从返回中提取候选...")
-    # 可以尝试另一种解析方式，比如正则提取多个 JSON 对象
-    # 但最简单的是直接返回 None，并打印提示
-        print("[BATCH] 建议检查 debug_raw.txt 查看原始返回")
+        print("[BATCH] JSON解析失败，建议检查 debug_raw.txt 查看原始返回")
         return None
-    
+
     if result.get("signal") == "NO_CLEAR_EDGE":
         print("[BATCH] 没有识别到有预期差的事件")
         return None
@@ -601,7 +584,6 @@ def run_batch(market_text="unknown"):
     if result.get("signal") == "ONE_BIG_EVENT":
         print("[BATCH] 使用 ONE_BIG_EVENT 模式")
         save_one_big_event(result)
-        
         con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
         count = cur.execute("SELECT COUNT(*) FROM event_scores").fetchone()[0]
